@@ -1,0 +1,83 @@
+name: build-and-deploy
+
+# Pull requests: build only (proves the image builds; nothing is pushed or deployed).
+# Push to main: build + push the image, then open/update a deploy PR in chat-infra.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  IMAGE: ghcr.io/jzviagin-chat-app/auth-service
+  INFRA_REPO: jzviagin-chat-app/chat-infra
+
+jobs:
+  build:
+    # Native Arm runner (free for public repos), so the image matches the Oracle Ampere VMs.
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Quick check
+        run: python3 -m py_compile app.py
+
+      - name: Compute image tag
+        id: meta
+        run: echo "tag=sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build (and push on main)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+
+  deploy:
+    # Opens (or updates) one PR in chat-infra that bumps the image tag.
+    # Merging that PR is the deploy: Argo CD syncs it to the cluster.
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out chat-infra
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.INFRA_REPO }}
+          token: ${{ secrets.INFRA_REPO_TOKEN }}
+          path: infra
+
+      - name: Bump image tag
+        run: |
+          sed -i -E "s#(image: ${IMAGE}):[^ ]+#\1:${{ needs.build.outputs.tag }}#" infra/k8s/auth.yaml
+          grep -n "image: ${IMAGE}" infra/k8s/auth.yaml
+
+      - name: Open deploy PR
+        uses: peter-evans/create-pull-request@v7
+        with:
+          path: infra
+          token: ${{ secrets.INFRA_REPO_TOKEN }}
+          branch: deploy/auth-service
+          title: "Deploy auth-service ${{ needs.build.outputs.tag }}"
+          commit-message: "Deploy auth-service ${{ needs.build.outputs.tag }}"
+          body: |
+            Built from jzviagin-chat-app/auth-service@${{ github.sha }}
+            Image: `${{ env.IMAGE }}:${{ needs.build.outputs.tag }}`
+
+            Merge to deploy. Argo CD rolls it out within ~3 minutes.
+          delete-branch: true
