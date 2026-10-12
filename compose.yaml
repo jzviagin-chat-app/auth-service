@@ -1,0 +1,15 @@
+# Local development dependencies. Start: docker compose up -d   Stop: docker compose down
+# Same Postgres major version as the cluster (k8s/database-postgres.yaml in chat-infra).
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: auth
+      POSTGRES_PASSWORD: auth   # local only
+      POSTGRES_DB: auth
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+volumes:
+  pgdata:

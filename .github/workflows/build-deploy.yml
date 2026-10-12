@@ -23,8 +23,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Quick check
-        run: python3 -m py_compile app.py
+      # Same checks you run locally (see README.md, "Everyday commands"). Any failure stops the build.
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.0"
+      - name: Install (exactly what uv.lock says)
+        run: uv sync --frozen
+      - name: Lint
+        run: uv run ruff check .
+      - name: Format check
+        run: uv run ruff format --check .
+      - name: Type check
+        run: uv run mypy
+      - name: Tests
+        run: uv run pytest
 
       - name: Compute image tag
         id: meta

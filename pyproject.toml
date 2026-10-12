@@ -1,0 +1,63 @@
+[project]
+name = "auth-service"
+version = "0.1.0"
+description = "Phone-number signup and login (SMS OTP), JWT access tokens, rotating refresh tokens."
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "alembic>=1.20.0",
+    "asyncpg>=0.32.0",
+    "fastapi>=0.143.0",
+    "pydantic-settings>=2.15.0",
+    "sqlalchemy[asyncio]>=2.1.4",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.0,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "mypy>=2.4.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.17.0",
+]
+
+# ---- tools (all run with `uv run <tool>`) ----
+
+[tool.ruff]                     # linter + formatter (like eslint + prettier)
+line-length = 100
+target-version = "py314"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes: unused imports/variables, undefined names
+    "I",        # import sorting
+    "B",        # bugbear: likely bugs
+    "UP",       # pyupgrade: modern syntax for our Python version
+    "ASYNC",    # async pitfalls, e.g. blocking calls inside async def
+    "S",        # bandit: security smells
+    "SIM",      # simplifications
+    "RUF",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]           # assert is how pytest works
+
+[tool.mypy]                     # type checker (like tsc --noEmit --strict)
+strict = true
+python_version = "3.14"
+plugins = ["pydantic.mypy"]
+mypy_path = "src"
+packages = ["auth_service"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"           # `async def test_...` just works
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-q"
