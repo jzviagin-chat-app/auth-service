@@ -6,10 +6,11 @@ services:
     environment:
       POSTGRES_USER: auth
       POSTGRES_PASSWORD: auth   # local only
-      POSTGRES_DB: auth
+      POSTGRES_DB: auth         # the database you develop against
     ports:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./dev/create-test-db.sql:/docker-entrypoint-initdb.d/create-test-db.sql:ro  # + auth_test
 volumes:
   pgdata:
