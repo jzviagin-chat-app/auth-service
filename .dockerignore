@@ -9,3 +9,6 @@ __pycache__
 .ruff_cache
 tests
 compose.yaml
+.context
+.claude
+CLAUDE.md
