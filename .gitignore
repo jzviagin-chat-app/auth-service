@@ -5,3 +5,6 @@ __pycache__/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+
+# Claude Code: clones of other repos used as context
+.context/
