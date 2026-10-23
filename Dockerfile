@@ -26,5 +26,7 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1
 USER app
 EXPOSE 8000
+# --no-proxy-headers: the app reads X-Forwarded-For itself, trusting only the ingress
+# (TRUSTED_PROXIES, see main.create_app). Trusting "*" here let clients fake their IP.
 CMD ["uvicorn", "auth_service.main:app", "--host", "0.0.0.0", "--port", "8000", \
-     "--proxy-headers", "--forwarded-allow-ips", "*", "--no-server-header"]
+     "--no-proxy-headers", "--no-server-header"]

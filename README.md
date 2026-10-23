@@ -3,8 +3,8 @@
 Sign-up and login with a phone number and an SMS code. It issues the tokens that every other
 service (chat-service first) uses to know **who** is calling and **from which device**.
 
-> **Status: skeleton.** The structure, tooling, logging, database connection, migrations setup,
-> tests and CI are in place. Only the health checks answer; feature endpoints are added step by step
+> **Status: first endpoint.** Structure, tooling, logging, database, migrations, tests and CI are in
+> place, and `POST /auth/otp/request` sends codes (fake SMS sender for now). Feature endpoints are added step by step
 > (see [Build plan](#13-build-plan)).
 
 ---
@@ -95,28 +95,38 @@ auth-service/
 ├── alembic/
 │   ├── env.py              # reads DATABASE_URL, uses our models' metadata
 │   ├── script.py.mako      # template for new migration files
-│   └── versions/           # one file per migration (empty for now)
+│   └── versions/           # one file per migration (0001 tables, 0002 sms_daily_usage)
 ├── src/auth_service/
 │   ├── main.py             # app factory: create_app(), lifespan (startup/shutdown), routers
 │   ├── config.py           # Settings from env vars (pydantic-settings), get_settings()
 │   ├── api/                # HTTP layer
-│   │   ├── health.py       #   /healthz, /auth/healthz (the only routes so far)
+│   │   ├── health.py       #   /healthz, /auth/healthz
 │   │   ├── router.py       #   mounts all feature routers under /auth
-│   │   ├── deps.py         #   dependencies routes receive (DbSession, later: current user)
-│   │   ├── otp.py          #   (empty) /auth/otp/request, /auth/otp/verify
+│   │   ├── errors.py       #   the {"error", "message"} shape for every error
+│   │   ├── deps.py         #   dependencies routes receive (DbSession, OtpContextDep)
+│   │   ├── otp.py          #   /auth/otp/request ✅, /auth/otp/verify (step 4)
 │   │   ├── tokens.py       #   (empty) /auth/token/refresh, /auth/logout
 │   │   ├── devices.py      #   (empty) /auth/devices
 │   │   └── jwks.py         #   (empty) /auth/.well-known/jwks.json
-│   ├── services/           # business logic (planned modules listed in __init__.py)
+│   ├── services/           # business logic
+│   │   ├── otp.py          #   request a code: validation, hashing, the flow, cleanup job
+│   │   ├── rate_limit.py   #   per-phone / per-IP limits in Redis
+│   │   └── sms.py          #   SmsSender interface + FakeSmsSender
 │   ├── db/
 │   │   ├── engine.py       #   connection pool + sessions (Database class)
-│   │   ├── models.py       #   tables (Base only, for now)
-│   │   └── repos.py        #   data access functions (empty)
+│   │   ├── models.py       #   tables
+│   │   └── repos.py        #   data access functions (the only SQL)
 │   └── core/
-│       └── logging.py      #   JSON logs to stdout
+│       ├── logging.py      #   JSON logs to stdout
+│       └── masking.py      #   mask_phone() for logs
 └── tests/
-    ├── conftest.py         # shared fixtures: in-process HTTP client
-    └── test_skeleton.py    # health checks, docs hidden in prod, URL conversion
+    ├── conftest.py         # shared fixtures, needs_db / needs_redis markers, alembic()
+    ├── test_skeleton.py    # health checks, docs hidden in prod, URL conversion
+    ├── test_errors.py      # error shape
+    ├── test_client_ip.py   # X-Forwarded-For handling behind the ingress
+    ├── test_otp_units.py   # pure OTP helpers
+    ├── test_otp_request.py # POST /auth/otp/request against real Postgres + Redis
+    └── test_migrations.py  # migrations + constraints against real Postgres
 ```
 
 **Why `src/auth_service/` and not just `app.py`:** with the `src/` layout, tests import the
@@ -208,12 +218,12 @@ Later each line also gets `trace_id`, linked to its trace in Tempo.
 Why not server sessions: every service would have to look up a shared session store on every request,
 and mobile apps don't handle cookies well. Why not one long-lived JWT: it can't be revoked.
 
-## 8. API (planned)
+## 8. API
 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/healthz`, `/auth/healthz` | – | Health checks ✅ |
-| POST | `/auth/otp/request` | – | Send an SMS code. Always `202`, so it never reveals whether a number is registered. Rate limited |
+| POST | `/auth/otp/request` | – | Send an SMS code ✅. Same `202` for every number, registered or not. Rate limited (below) |
 | POST | `/auth/otp/verify` | – | Check the code → user + device + tokens |
 | POST | `/auth/token/refresh` | refresh token | Rotate → new pair |
 | POST | `/auth/logout` | access token | Revoke this device's refresh chain |
@@ -223,11 +233,38 @@ and mobile apps don't handle cookies well. Why not one long-lived JWT: it can't 
 | GET | `/auth/docs` | – | Interactive API docs, **dev only** |
 
 Errors use one shape everywhere: `{"error": "<code>", "message": "<human text>"}`. Clients branch on
-`error`, never on `message`.
+`error`, never on `message`. Codes so far: `invalid_request` (422, malformed body; names the fields,
+never echoes values), `not_found`, `method_not_allowed`, `internal_error` (500), and the ones below.
+
+**`POST /auth/otp/request`** `{"phone": "+972501234567"}`
+
+| Answer | When |
+|---|---|
+| `202 {"resend_after_seconds": 60, "expires_in_seconds": 300}` | Code sent |
+| `400 invalid_phone` | Not an Israeli mobile number in E.164 form (`+9725XXXXXXXX`) |
+| `429 rate_limited` + `Retry-After: <seconds>` | 60 s resend cooldown; max 5/hour and 10/day per phone; max 30/hour and 200/day per IP |
+| `503 sms_unavailable` | Global daily SMS cap reached, Redis unreachable (fail closed), SMS provider failed, or not configured |
+
+The limits apply to registered and unknown numbers alike, and the endpoint never reads `users`, so no
+answer reveals whether a number has an account.
+
+Flow (`api/otp.py` → `services/otp.py`):
+1. Validate the number (Israel-only is an SMS cost guard).
+2. Redis limits (`services/rate_limit.py`): keys `auth:rl:phone:<HMAC of phone>:cooldown|h|d` and
+   `auth:rl:ip:<ip>:h|d`, counted with `INCR` + `EXPIRE NX` in `MULTI/EXEC` transactions. The phone is an
+   HMAC in the key, so no phone numbers sit in Redis.
+3. Daily cap (`sms_daily_usage`, atomic `UPDATE … WHERE sent < cap`) and the `otp_challenges` row, in one
+   transaction.
+4. Send after the commit, so no code reaches a phone unless it can be verified.
+
+**Client IP:** `request.client.host` comes from `X-Forwarded-For`, believed only from `TRUSTED_PROXIES`
+(the ingress in the pod network `10.42.0.0/16`). HAProxy appends to whatever the client sent, so the app
+takes the rightmost untrusted address (uvicorn's `ProxyHeadersMiddleware`, added in `create_app()`;
+the Dockerfile runs uvicorn with `--no-proxy-headers`).
 
 ## 9. Data model
 
-In `db/models.py`; migration `alembic/versions/0001_initial.py` creates the first three tables.
+In `db/models.py`; migration `0001_initial.py` creates the first three tables, `0002_sms_daily_usage.py` the cap.
 IDs are UUIDv7 generated by the app (no database default). All times are `timestamptz`.
 
 | Table | Key columns | Notes |
@@ -236,10 +273,11 @@ IDs are UUIDv7 generated by the app (no database default). All times are `timest
 | `devices` ✅ | `id uuid PK`, `user_id FK → users ON DELETE CASCADE`, `platform` (`ios`/`android`/`web`), `name`, `created_at`, `last_seen_at`, `revoked_at` | One row per installed app. `public_key` added with E2E |
 | `otp_challenges` ✅ | `id`, `phone_e164`, `code_hash bytea`, `created_at`, `expires_at`, `attempts`, `consumed_at`, `request_ip inet`; index `(phone_e164, created_at)` | Keyed by phone, not user: the code is sent before the user exists. Valid 5 min, max 5 attempts, single use; rows deleted after 24 h |
 | `refresh_tokens` | `id`, `device_id FK`, `family_id`, `token_hash UNIQUE`, `parent_id`, `expires_at`, `used_at`, `revoked_at`, `created_at` | `family_id` = the chain; reuse ⇒ revoke the family |
-| `sms_daily_usage` | `day PK`, `sent` | Global daily SMS cap. Kept in Postgres, **not** Redis, so a Redis restart can't reset the money guard |
+| `sms_daily_usage` ✅ | `day date PK` (UTC), `sent int` (check `>= 0`) | Global daily SMS cap. Kept in Postgres, **not** Redis, so a Redis restart can't reset the money guard |
 
-Per-phone and per-IP rate limits live in Redis (losing them on a restart is acceptable).
-Expired OTP rows and refresh tokens are cleaned up by a periodic job (later).
+Per-phone and per-IP rate limits live in Redis db 1 (losing them on a restart is acceptable).
+`otp_challenges` rows older than 24 h are deleted by an hourly loop in every pod (`services/otp.cleanup_loop`,
+started in `main.lifespan`; harmless to run twice). Refresh-token cleanup comes with step 6.
 Later: `device_links` for linking secondary devices by QR code (PLAN.md, "Later").
 
 **Migration rules**
@@ -251,12 +289,18 @@ Later: `device_links` for linking secondary devices by QR code (PLAN.md, "Later"
 - The test `test_models_match_migrations` fails if models and migrations disagree.
 
 ## 10. Security rules
-- **Never log** OTP codes, tokens or full phone numbers. Mask them: `+97250***4567`.
-- OTP codes: 6 digits, stored as `HMAC-SHA256(server_pepper, phone + code)`. They are compared in
+- **Never log** OTP codes, tokens or full phone numbers. Mask them: `+97250***4567` (`core/masking.py`).
+  Guards against accidental leaks: the DB engine has `hide_parameters=True` (query values never appear in
+  error messages), 422 errors name fields but never echo values, Redis keys hold an HMAC instead of the
+  phone, and SMS senders raise `SmsSendError` with a short status, never the provider's error text.
+  `test_logs_never_contain_the_phone_or_code` checks every path. Only `ENVIRONMENT=dev` lets the fake
+  sender log the message text (so you can read the code locally).
+- OTP codes: 6 digits from `secrets`, stored as `HMAC-SHA256(OTP_PEPPER, "phone:code")`. They are compared in
   constant time (`hmac.compare_digest`), expire after 5 minutes, are invalidated after 5 wrong tries,
   and work once.
 - Refresh tokens: only the SHA-256 hash is stored, so a database leak doesn't hand out usable tokens.
-- `otp/request` always answers `202` the same way (no account enumeration), with a 60 s resend cooldown.
+- `otp/request` answers the same way for registered and unknown numbers (no account enumeration), with a
+  60 s resend cooldown.
 - SMS cost guards (before any paid provider is switched on): Israel-only numbers, a per-phone and
   per-IP limit, a **global daily cap**, and on the provider side prepaid credit with auto-recharge off.
 - Secrets (DB URL, signing key, OTP pepper, SMS credentials) come only from Kubernetes Secrets
@@ -269,11 +313,19 @@ Later: `device_links` for linking secondary devices by QR code (PLAN.md, "Later"
 | `ENVIRONMENT` | `prod` | `dev` enables `/auth/docs` |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `POD_NAME` | `local` | Set by Kubernetes; added to every log line |
-| `DATABASE_URL` | – | `postgresql://user:pass@host:5432/db`. Optional until the first DB feature |
+| `DATABASE_URL` | – | `postgresql://user:pass@host:5432/db` (Secret `auth-db` in the cluster) |
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | `5` / `5` | Connections per pod: at most 10 × 2 pods, against Postgres' `max_connections=50` |
+| `REDIS_URL` | – | `redis://redis:6379/1` in the cluster. Unset/unreachable → `otp/request` answers 503 |
+| `OTP_PEPPER` | – | Secret key for code hashes (Secret `auth-otp`). Unset → `otp/request` answers 503 |
+| `TRUSTED_PROXIES` | `["10.42.0.0/16"]` | Who may set `X-Forwarded-For` (JSON list) |
+| `OTP_TTL_SECONDS` / `OTP_RESEND_COOLDOWN_SECONDS` | `300` / `60` | Code lifetime / resend cooldown |
+| `OTP_PHONE_MAX_PER_HOUR` / `_PER_DAY` | `5` / `10` | Codes per phone |
+| `OTP_IP_MAX_PER_HOUR` / `_PER_DAY` | `30` / `200` | Codes per client IP (generous: carrier-grade NAT) |
+| `OTP_RETENTION_HOURS` / `OTP_CLEANUP_INTERVAL_SECONDS` | `24` / `3600` | Cleanup job |
+| `SMS_PROVIDER` | `fake` | Only `fake` so far (sends nothing) |
+| `SMS_DAILY_CAP` | `100` | Max SMS per UTC day, all pods together |
 
-More settings are added with the steps that need them (token lifetimes, key file, OTP pepper,
-Redis URL, SMS provider).
+More settings are added with the steps that need them (token lifetimes, signing key, SMS provider credentials).
 
 ## 12. Everyday commands
 
@@ -281,11 +333,17 @@ One-time setup (Mac): `brew install uv`, then in this folder:
 ```bash
 uv sync                          # creates .venv with Python 3.14 + all packages (≈ npm install)
 cp .env.example .env             # local settings
-docker compose up -d             # local Postgres on localhost:5432 (databases auth + auth_test)
+docker compose up -d             # local Postgres :5432 (databases auth + auth_test) and Redis :6379
+uv run alembic upgrade head      # bring your dev database to the latest migration
 ```
-Database tests run only when `TEST_DATABASE_URL` is set (it is in `.env.example`; CI sets it too). They wipe
-that database, so it must never be the one you develop against. Without it they are skipped (`uv run pytest -rs`
-shows why).
+Database tests run only when `TEST_DATABASE_URL` is set, and the OTP tests also need `TEST_REDIS_URL` (both are
+in `.env.example`; CI sets them too). They wipe that database and Redis db 15, so these must never be the ones
+you develop against. Without them they are skipped (`uv run pytest -rs` shows why).
+
+Try the endpoint locally (with `ENVIRONMENT=dev` the fake sender logs the code):
+```bash
+curl -i -X POST localhost:8000/auth/otp/request -H 'content-type: application/json' -d '{"phone":"+972501234567"}'
+```
 
 | Task | Command | Node equivalent |
 |---|---|---|
@@ -309,15 +367,17 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy && uv run pyt
 Each step is small, tested and deployed before the next.
 
 1. ✅ **Skeleton**: structure, tooling, JSON logs, DB pool, Alembic, tests, CI, Docker.
-2. 🔨 First tables (`users`, `devices`, `otp_challenges`) + migration 0001 + database tests (CI runs a Postgres);
-   run migrations in the cluster (`migrate` init container in `k8s/auth.yaml`, chat-infra PR).
-3. `POST /auth/otp/request` with a **fake SMS sender** (₪0) + rate limits.
+2. ✅ First tables (`users`, `devices`, `otp_challenges`) + migration 0001 + database tests (CI runs a Postgres);
+   migrations run in the cluster by the `migrate` init container (`k8s/auth.yaml`).
+3. 🔨 `POST /auth/otp/request` with a **fake SMS sender** (₪0) + per-phone/per-IP limits (Redis) + daily
+   SMS cap (Postgres) + OTP cleanup job + error shape + client-IP fix. Real SMS provider to follow once chosen.
 4. `POST /auth/otp/verify` → user + device.
 5. Signing keys + access tokens + `jwks.json`.
 6. Refresh tokens: issue, rotate, reuse detection, logout, devices list/remove.
 7. Tracing (OpenTelemetry → Tempo) + metrics.
 8. Dummy Expo app against it (PLAN.md phase 8).
-9. Real SMS provider behind a flag, with all cost guards (only when you decide).
+9. ~~Real SMS provider~~: moved into step 3 (decided 2026-10-22), as a plain SMS API behind `SMS_PROVIDER`,
+   once the provider is chosen.
 
 ## 14. Deployment
 - Push to `main` → GitHub Actions (ARM runner): checks → image

@@ -12,5 +12,12 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./dev/create-test-db.sql:/docker-entrypoint-initdb.d/create-test-db.sql:ro  # + auth_test
+  # Same version and settings as the cluster (k8s/redis.yaml): no persistence, rate-limit counters only.
+  # db 0 = development, db 15 = tests (wiped by them).
+  redis:
+    image: redis:7.4-alpine
+    command: ["--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
 volumes:
   pgdata:

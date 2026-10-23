@@ -8,13 +8,15 @@ Conventions:
 """
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from sqlalchemy import (
     CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     LargeBinary,
     MetaData,
     SmallInteger,
@@ -106,3 +108,17 @@ class OtpChallenge(Base):
     attempts: Mapped[int] = mapped_column(SmallInteger, server_default="0")
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     request_ip: Mapped[str | None] = mapped_column(INET)
+
+
+class SmsDailyUsage(Base):
+    """How many SMS were sent on each UTC day: the global daily cap, a money guard.
+
+    Kept in Postgres (not Redis) so a restart can't reset it, and counted with one atomic
+    UPDATE ... WHERE sent < cap, so two pods racing can never go over the cap.
+    """
+
+    __tablename__ = "sms_daily_usage"
+    __table_args__ = (CheckConstraint("sent >= 0", name="sent_non_negative"),)
+
+    day: Mapped[date] = mapped_column(Date, primary_key=True)  # UTC
+    sent: Mapped[int] = mapped_column(Integer, server_default="0")
