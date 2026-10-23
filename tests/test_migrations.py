@@ -1,12 +1,9 @@
 """Migrations against a real Postgres: they apply, roll back, match the models, and the
 constraints really protect the data. Skipped when TEST_DATABASE_URL is not set."""
 
-import os
-import subprocess
-import sys
 import uuid
 from collections.abc import AsyncIterator, Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from sqlalchemy import text
@@ -14,24 +11,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from auth_service.db.engine import to_async_url
-from auth_service.db.models import Device, OtpChallenge, User
-from tests.conftest import TEST_DATABASE_URL, needs_db
+from auth_service.db.models import Device, OtpChallenge, SmsDailyUsage, User
+from tests.conftest import TEST_DATABASE_URL, alembic, needs_db
 
 pytestmark = needs_db
-
-
-def alembic(*args: str) -> str:
-    """Run the alembic CLI exactly like the cluster does, against the test database."""
-    env = {**os.environ, "DATABASE_URL": TEST_DATABASE_URL or ""}
-    result = subprocess.run(  # noqa: S603 (fixed command, test only)
-        [sys.executable, "-m", "alembic", *args],  # the alembic installed in this .venv
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    return result.stdout + result.stderr
 
 
 @pytest.fixture(scope="module")
@@ -49,14 +32,14 @@ async def session(migrated: None) -> AsyncIterator[AsyncSession]:
         yield s
         await s.rollback()
     async with engine.begin() as conn:  # leave the tables empty for the next test
-        await conn.execute(text("TRUNCATE users, devices, otp_challenges CASCADE"))
+        await conn.execute(text("TRUNCATE users, devices, otp_challenges, sms_daily_usage CASCADE"))
     await engine.dispose()
 
 
 def test_upgrade_downgrade_roundtrip(migrated: None) -> None:
     alembic("downgrade", "base")
     alembic("upgrade", "head")
-    assert "0001" in alembic("current")
+    assert "(head)" in alembic("current")
 
 
 def test_models_match_migrations(migrated: None) -> None:
@@ -123,3 +106,9 @@ async def test_otp_challenge_defaults(session: AsyncSession) -> None:
     assert otp.attempts == 0
     assert otp.consumed_at is None
     assert otp.created_at is not None
+
+
+async def test_sms_daily_usage_never_negative(session: AsyncSession) -> None:
+    session.add(SmsDailyUsage(day=date(2026, 10, 22), sent=-1))
+    with pytest.raises(IntegrityError, match="ck_sms_daily_usage_sent_non_negative"):
+        await session.commit()

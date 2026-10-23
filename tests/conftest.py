@@ -1,6 +1,8 @@
 """Shared test fixtures (like jest's setup files)."""
 
 import os
+import subprocess
+import sys
 from collections.abc import AsyncIterator, Iterator
 
 import pytest
@@ -17,6 +19,25 @@ TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 needs_db = pytest.mark.skipif(
     not TEST_DATABASE_URL, reason="TEST_DATABASE_URL not set (see README, 'Everyday commands')"
 )
+# Same for Redis: a db number the tests may wipe (15 locally and in CI).
+TEST_REDIS_URL = os.environ.get("TEST_REDIS_URL")
+needs_redis = pytest.mark.skipif(
+    not TEST_REDIS_URL, reason="TEST_REDIS_URL not set (see README, 'Everyday commands')"
+)
+
+
+def alembic(*args: str) -> str:
+    """Run the alembic CLI exactly like the cluster does, against the test database."""
+    env = {**os.environ, "DATABASE_URL": TEST_DATABASE_URL or ""}
+    result = subprocess.run(  # noqa: S603 (fixed command, test only)
+        [sys.executable, "-m", "alembic", *args],  # the alembic installed in this .venv
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return result.stdout + result.stderr
 
 
 @pytest.fixture

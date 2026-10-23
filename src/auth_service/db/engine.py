@@ -27,6 +27,9 @@ class Database:
             pool_size=pool_size,
             max_overflow=max_overflow,
             pool_pre_ping=True,  # drop dead connections (e.g. after a Postgres restart)
+            # Keep query values (phone numbers, code hashes) out of error messages: they get logged.
+            # Like turning off parameter logging in Prisma/TypeORM.
+            hide_parameters=True,
         )
         # expire_on_commit=False: objects stay readable after commit (no surprise lazy reloads,
         # which would need an `await` in async code).
