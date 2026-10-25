@@ -7,8 +7,36 @@ Pydantic validates the types at startup, so a bad value fails fast instead of mi
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import PositiveInt, SecretStr
+from pydantic import Field, PositiveFloat, PositiveInt, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# ---- SMS providers: one settings block per provider, each with its own env var prefix ----
+#
+# Plain values (sender, cap, timeout) have their defaults here: changing them is an auth-service
+# release. Secret fields only *point to* an env var, which Kubernetes fills from a sealed Secret
+# (chat-infra); the comment on each secret field names that Secret. No secret values in code.
+
+
+class FakeSmsSettings(BaseSettings):
+    """Provider "fake": sends nothing, costs nothing (development, tests, CI). Env: FAKE_SMS_*."""
+
+    model_config = SettingsConfigDict(env_prefix="FAKE_SMS_", env_file=".env", extra="ignore")
+
+    daily_cap: PositiveInt = 100  # FAKE_SMS_DAILY_CAP
+
+
+class GlobalSmsSettings(BaseSettings):
+    """Provider "globalsms": Global SMS, api.itnewsletter.co.il. Env: GLOBALSMS_*."""
+
+    model_config = SettingsConfigDict(env_prefix="GLOBALSMS_", env_file=".env", extra="ignore")
+
+    # GLOBALSMS_API_KEY <- sealed Secret "auth-sms" (k8s/auth.yaml in chat-infra).
+    api_key: SecretStr | None = None
+    # Sender shown to recipients: a name or number pre-approved in the Global SMS account (max 11
+    # characters). Set the default here once it's approved; until then the provider can't be used.
+    originator: str | None = Field(default=None, max_length=11)
+    daily_cap: PositiveInt = 100  # GLOBALSMS_DAILY_CAP
+    timeout_seconds: PositiveFloat = 5  # the whole request, so a slow provider can't hang requests
 
 
 class Settings(BaseSettings):
@@ -49,10 +77,20 @@ class Settings(BaseSettings):
     otp_retention_hours: PositiveInt = 24  # older otp_challenges rows are deleted
     otp_cleanup_interval_seconds: PositiveInt = 3600
 
-    # Which SMS sender to use. Only "fake" exists for now (logs instead of sending, costs nothing).
-    sms_provider: Literal["fake"] = "fake"
-    # Global money guard: at most this many SMS per UTC day, across all pods (counted in Postgres).
-    sms_daily_cap: PositiveInt = 100
+    # Which SMS provider sends the codes. Each one has its own settings block (above).
+    sms_provider: Literal["fake", "globalsms"] = "fake"
+    fake_sms: FakeSmsSettings = Field(default_factory=FakeSmsSettings)
+    globalsms: GlobalSmsSettings = Field(default_factory=GlobalSmsSettings)
+
+    @property
+    def sms_daily_cap(self) -> int:
+        """Global money guard: max SMS per UTC day, all pods together (counted in Postgres).
+        The active provider's cap; the count itself is shared (one row per day)."""
+        match self.sms_provider:
+            case "fake":
+                return self.fake_sms.daily_cap
+            case "globalsms":
+                return self.globalsms.daily_cap
 
 
 @lru_cache

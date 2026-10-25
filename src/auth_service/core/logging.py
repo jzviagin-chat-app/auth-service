@@ -63,3 +63,6 @@ def setup_logging(level: str, service: str, pod: str) -> None:
         lg.handlers.clear()
         lg.propagate = True
     logging.getLogger("uvicorn.access").addFilter(_DropHealthChecks())
+    # httpx logs every outgoing request with its full URL at INFO; a provider URL may carry an API
+    # key (e.g. Global SMS's getBalance takes ?ApiKey=). Keep only its warnings and errors.
+    logging.getLogger("httpx").setLevel(logging.WARNING)

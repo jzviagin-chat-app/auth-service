@@ -64,6 +64,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         cleanup.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await cleanup
+    if app.state.sms is not None:
+        await app.state.sms.aclose()  # e.g. the provider's HTTP connection pool
     if app.state.redis is not None:
         await app.state.redis.aclose()
     if app.state.db is not None:
