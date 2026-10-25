@@ -3,12 +3,14 @@
 Skipped unless both TEST_DATABASE_URL and TEST_REDIS_URL are set (README, "Everyday commands").
 """
 
+import json
 import logging
 import re
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
@@ -20,7 +22,7 @@ from auth_service.core.logging import JsonFormatter
 from auth_service.db.models import OtpChallenge, SmsDailyUsage
 from auth_service.main import create_app
 from auth_service.services.otp import delete_old_challenges, hash_code
-from auth_service.services.sms import SmsSendError
+from auth_service.services.sms import GlobalSmsSender, SmsSendError
 from tests.conftest import TEST_DATABASE_URL, TEST_REDIS_URL, alembic, needs_db, needs_redis
 
 pytestmark = [needs_db, needs_redis]
@@ -44,6 +46,9 @@ class RecordingSms:
             raise SmsSendError("http_500")
         self.sent.append((phone_e164, text))
         return f"msg-{len(self.sent)}"
+
+    async def aclose(self) -> None:
+        return None
 
     def last_code(self) -> str:
         match = re.search(r"[0-9]{6}", self.sent[-1][1])
@@ -192,7 +197,7 @@ async def test_ip_hourly_limit(app: FastAPI, monkeypatch: pytest.MonkeyPatch) ->
 
 
 async def test_daily_cap(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None:
-    set_setting(monkeypatch, "SMS_DAILY_CAP", "1")
+    set_setting(monkeypatch, "FAKE_SMS_DAILY_CAP", "1")
     assert (await request_code(app, "+972501111111"))[0] == 202
     status, r = await request_code(app, "+972502222222")
     assert status == 503
@@ -242,7 +247,7 @@ async def test_logs_never_contain_the_phone_or_code(
     app.state.sms.fail = True
     await request_code(app)  # provider failure
     app.state.sms.fail = False
-    set_setting(monkeypatch, "SMS_DAILY_CAP", "1")
+    set_setting(monkeypatch, "FAKE_SMS_DAILY_CAP", "1")
     await end_cooldown(app)
     await request_code(app)  # 503 daily cap
 
@@ -280,3 +285,45 @@ async def test_cleanup_deletes_only_old_challenges(app: FastAPI) -> None:
 
     await delete_old_challenges(app.state.db, timedelta(hours=24))
     assert [c.phone_e164 for c in await challenges(app)] == ["+972502222222"]
+
+
+# ---- the real Global SMS sender, provider mocked at the HTTP level ----
+
+
+def globalsms_answering(status: int, text: str, seen: list[httpx.Request]) -> GlobalSmsSender:
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(status, text=text)
+
+    return GlobalSmsSender("secret-api-key", "MyApp", 5, transport=httpx.MockTransport(handler))
+
+
+async def test_globalsms_end_to_end(app: FastAPI, caplog: pytest.LogCaptureFixture) -> None:
+    logging.getLogger().addHandler(caplog.handler)  # create_app() replaced the root handlers
+    caplog.set_level(logging.DEBUG)
+    seen: list[httpx.Request] = []
+    app.state.sms = globalsms_answering(200, "1", seen)  # closed by the app's shutdown
+
+    status, _ = await request_code(app)
+    assert status == 202
+
+    [request] = seen
+    body = json.loads(request.content)
+    assert body["destinations"] == "0501234567"
+    code = re.search(r"[0-9]{6}", body["txtSMSmessage"])
+    assert code
+    [row] = await challenges(app)
+    assert row.code_hash == hash_code(PEPPER.encode(), PHONE, code.group())
+
+    output = "\n".join(JsonFormatter("auth-service", "test").format(r) for r in caplog.records)
+    assert '"provider": "globalsms"' in output
+    assert "secret-api-key" not in output
+    assert "501234567" not in output  # neither +972501234567 nor 0501234567
+    assert code.group() not in output
+
+
+async def test_globalsms_refusal_is_503(app: FastAPI) -> None:
+    app.state.sms = globalsms_answering(403, "", [])  # e.g. our IP isn't approved
+    status, r = await request_code(app)
+    assert status == 503
+    assert r["json"]["error"] == "sms_unavailable"

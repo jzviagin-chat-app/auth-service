@@ -4,7 +4,7 @@ Sign-up and login with a phone number and an SMS code. It issues the tokens that
 service (chat-service first) uses to know **who** is calling and **from which device**.
 
 > **Status: first endpoint.** Structure, tooling, logging, database, migrations, tests and CI are in
-> place, and `POST /auth/otp/request` sends codes (fake SMS sender for now). Feature endpoints are added step by step
+> place, and `POST /auth/otp/request` sends codes (fake sender, or Global SMS via `SMS_PROVIDER`). Feature endpoints are added step by step
 > (see [Build plan](#13-build-plan)).
 
 ---
@@ -111,7 +111,7 @@ auth-service/
 │   ├── services/           # business logic
 │   │   ├── otp.py          #   request a code: validation, hashing, the flow, cleanup job
 │   │   ├── rate_limit.py   #   per-phone / per-IP limits in Redis
-│   │   └── sms.py          #   SmsSender interface + FakeSmsSender
+│   │   └── sms.py          #   SmsSender interface, FakeSmsSender, GlobalSmsSender, make_sms_sender()
 │   ├── db/
 │   │   ├── engine.py       #   connection pool + sessions (Database class)
 │   │   ├── models.py       #   tables
@@ -322,8 +322,26 @@ Later: `device_links` for linking secondary devices by QR code (PLAN.md, "Later"
 | `OTP_PHONE_MAX_PER_HOUR` / `_PER_DAY` | `5` / `10` | Codes per phone |
 | `OTP_IP_MAX_PER_HOUR` / `_PER_DAY` | `30` / `200` | Codes per client IP (generous: carrier-grade NAT) |
 | `OTP_RETENTION_HOURS` / `OTP_CLEANUP_INTERVAL_SECONDS` | `24` / `3600` | Cleanup job |
-| `SMS_PROVIDER` | `fake` | Only `fake` so far (sends nothing) |
-| `SMS_DAILY_CAP` | `100` | Max SMS per UTC day, all pods together |
+| `SMS_PROVIDER` | `fake` | `fake` (sends nothing) or `globalsms` |
+| `FAKE_SMS_DAILY_CAP` | `100` | Daily SMS cap while the fake provider is active |
+| `GLOBALSMS_API_KEY` | – | Global SMS key. In the cluster: sealed Secret `auth-sms` |
+| `GLOBALSMS_ORIGINATOR` | – (default in `config.py` once approved) | Approved sender name/number, max 11 chars |
+| `GLOBALSMS_DAILY_CAP` / `GLOBALSMS_TIMEOUT_SECONDS` | `100` / `5` | Daily cap / whole-request timeout |
+
+**SMS providers.** Each provider has its own settings block in `config.py` (`FakeSmsSettings`,
+`GlobalSmsSettings`) with its own env prefix. Plain values (sender, cap, timeout) have their defaults there;
+secret fields only point to an env var that Kubernetes fills from a sealed Secret. The daily count in
+`sms_daily_usage` is shared; the cap is the active provider's. `make_sms_sender()` in `services/sms.py` is
+the only place that knows provider names; a provider that isn't fully configured gives no sender, and
+`otp/request` answers 503 (never a silent fallback to fake). Adding a provider = a class with `name`,
+`send()` and `aclose()` (the `SmsSender` Protocol), its settings block, and one `case`.
+
+**Global SMS** (`GlobalSmsSender`): `POST https://api.itnewsletter.co.il/api/restApiSms/sendSmsToRecipients`
+with a JSON body (`ApiKey`, `txtOriginator`, `destinations` as `05XXXXXXXX`, `txtSMSmessage`, `txtAddInf` =
+our 14-char message id, which shows up in their delivery reports). Success is a number (credits charged);
+errors are plain-text strings, mapped to fixed status codes (`invalid_login`, `not_enough_credit`,
+`unapproved_originator`, `http_403`, `timeout`, …) that are safe to log. Only approved caller IPs may use
+their API (HTTP 403 otherwise). An English code message is 1 credit (up to 160 characters).
 
 More settings are added with the steps that need them (token lifetimes, signing key, SMS provider credentials).
 
@@ -369,15 +387,16 @@ Each step is small, tested and deployed before the next.
 1. ✅ **Skeleton**: structure, tooling, JSON logs, DB pool, Alembic, tests, CI, Docker.
 2. ✅ First tables (`users`, `devices`, `otp_challenges`) + migration 0001 + database tests (CI runs a Postgres);
    migrations run in the cluster by the `migrate` init container (`k8s/auth.yaml`).
-3. 🔨 `POST /auth/otp/request` with a **fake SMS sender** (₪0) + per-phone/per-IP limits (Redis) + daily
-   SMS cap (Postgres) + OTP cleanup job + error shape + client-IP fix. Real SMS provider to follow once chosen.
+3. ✅ `POST /auth/otp/request` with a **fake SMS sender** (₪0) + per-phone/per-IP limits (Redis) + daily
+   SMS cap (Postgres) + OTP cleanup job + error shape + client-IP fix (deployed).
+   🔨 Real provider: Global SMS behind `SMS_PROVIDER=globalsms` (waiting for the approved sender).
 4. `POST /auth/otp/verify` → user + device.
 5. Signing keys + access tokens + `jwks.json`.
 6. Refresh tokens: issue, rotate, reuse detection, logout, devices list/remove.
 7. Tracing (OpenTelemetry → Tempo) + metrics.
 8. Dummy Expo app against it (PLAN.md phase 8).
-9. ~~Real SMS provider~~: moved into step 3 (decided 2026-10-22), as a plain SMS API behind `SMS_PROVIDER`,
-   once the provider is chosen.
+9. ~~Real SMS provider~~: moved into step 3 (decided 2026-10-22): Global SMS, a plain SMS API behind `SMS_PROVIDER`,
+   with the owner's per-provider settings in `config.py`.
 
 ## 14. Deployment
 - Push to `main` → GitHub Actions (ARM runner): checks → image
