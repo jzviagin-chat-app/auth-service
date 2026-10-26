@@ -339,8 +339,10 @@ the only place that knows provider names; a provider that isn't fully configured
 
 **Global SMS** (`GlobalSmsSender`): `POST <GLOBALSMS_BASE_URL>/api/restApiSms/sendSmsToRecipients`
 with a JSON body (`ApiKey`, `txtOriginator`, `destinations` as `05XXXXXXXX`, `txtSMSmessage`, `txtAddInf` =
-our 14-char message id, which shows up in their delivery reports). Success is a number (credits charged);
-errors are plain-text strings, mapped to fixed status codes (`invalid_login`, `not_enough_credit`,
+our 14-char message id, which shows up in their delivery reports). The endpoint answers in JSON,
+`{"success":true,"result":1,"errDesc":""}` (`result` = credits charged), although their docs describe plain
+text (`1`, or an error text); both forms are read (`read_answer()`). Error texts (`errDesc`, or the plain text)
+are mapped to fixed status codes (`invalid_login`, `not_enough_credit`,
 `unapproved_originator`, `http_403`, `timeout`, …) that are safe to log. We use their `sapi` host, which
 has no IP allow-list (their `api` host only accepts approved IPs), so the API key alone authorizes sending:
 keep it secret. An English code message is 1 credit (up to 160 characters). Verified with a real send on

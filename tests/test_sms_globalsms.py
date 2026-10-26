@@ -19,6 +19,7 @@ from auth_service.services.sms import (
     SmsSendError,
     make_sms_sender,
     parse_credits,
+    read_answer,
     to_local_israeli,
 )
 
@@ -87,7 +88,23 @@ async def test_request_sent_as_documented() -> None:
     assert re.fullmatch(r"[0-9a-f]{14}", message_id)  # max 15 chars allowed by the provider
 
 
-@pytest.mark.parametrize("answer", ["1", "2.5", " 1\r\n"])
+# The real answer of the REST endpoint on sapi (captured 2026-10-26).
+REAL_SUCCESS = '{"success":true,"result":1,"resultJSON":"[]","errDesc":""}'
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        REAL_SUCCESS,
+        '{"success":true,"result":2.5,"resultJSON":"[]","errDesc":""}',
+        '{"success":true,"result":"1","errDesc":""}',
+        '{"success":true}',  # sent, even without a cost: never report a sent SMS as failed
+        '"1"',  # a JSON-quoted plain answer
+        "1",  # the plain-text form from their docs
+        "2.5",
+        " 1\r\n",
+    ],
+)
 async def test_numeric_answer_is_success(answer: str) -> None:
     sender = sender_answering(text=answer)
     assert await sender.send(PHONE, "hi")
@@ -113,6 +130,13 @@ async def test_numeric_answer_is_success(answer: str) -> None:
         ("Not enough credit in your account", "not_enough_credit"),
         ("system error", "system_error"),
         ("Wrong Date Format (dteToDeliver)", "bad_date"),
+        # JSON failures carry the docs' error text in errDesc. The real answer to a wrong key
+        # (captured 2026-10-26):
+        ('{"success":false,"result":0,"resultJSON":"[]","errDesc":"e 1"}', "bad_key_format"),
+        ('{"success":false,"result":0,"errDesc":"invalid login"}', "invalid_login"),
+        ('{"success":false,"errDesc":"Not enough credit in your account"}', "not_enough_credit"),
+        ('{"success":false,"errDesc":""}', "unexpected_response"),
+        ('{"success":"yes","result":1}', "unexpected_response"),  # only a real true counts
         ("something new", "unexpected_response"),
         ("", "unexpected_response"),
         ("-1", "unexpected_response"),
@@ -248,3 +272,21 @@ def test_globalsms_defaults() -> None:
     cfg = GlobalSmsSettings()
     assert cfg.base_url == "https://sapi.itnewsletter.co.il"  # their host without an IP allow-list
     assert cfg.originator == "ZviaginChat"  # the approved sender
+
+
+def test_read_answer() -> None:
+    assert read_answer(REAL_SUCCESS) == (True, 1.0, "")
+    assert read_answer("1") == (True, 1.0, "")
+    assert read_answer(" invalid login ") == (False, None, "invalid login")
+    failure = '{"success":false,"errDesc":"empty message"}'
+    assert read_answer(failure) == (False, None, "empty message")
+
+
+async def test_unexpected_answer_is_logged_safely(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.DEBUG)
+    odd = '{"success":false,"errDesc":"weird thing for 0584654123"}'
+    assert await send_status(sender_answering(text=odd)) == "unexpected_response"
+    [record] = [r for r in caplog.records if r.getMessage() == "globalsms unexpected answer"]
+    preview = record.__dict__["preview"]
+    assert "weird thing" in preview  # enough to see what they answered...
+    assert "0584654123" not in preview  # ...with long digit runs masked

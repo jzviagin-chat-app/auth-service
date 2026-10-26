@@ -8,8 +8,10 @@ Logging rule: a provider's errors can contain the request (API key, phone number
 raise SmsSendError with a short, fixed status only, never the original error text.
 """
 
+import json
 import logging
 import math
+import re
 import secrets
 from typing import Protocol
 
@@ -98,13 +100,41 @@ def to_local_israeli(phone_e164: str) -> str:
     return "0" + phone_e164.removeprefix("+972")
 
 
-def parse_credits(text: str) -> float | None:
-    """The success answer: credits charged ("1", "2.5"). None if `text` isn't a number."""
+def parse_credits(value: object) -> float | None:
+    """Credits charged (1, "1", "2.5"). None if `value` isn't a non-negative number."""
+    if isinstance(value, bool) or not isinstance(value, int | float | str):
+        return None
     try:
-        credits = float(text)
+        credits = float(value)
     except ValueError:
         return None
     return credits if math.isfinite(credits) and credits >= 0 else None
+
+
+def read_answer(body: str) -> tuple[bool, float | None, str]:
+    """Global SMS's answer -> (accepted, credits charged, error text).
+
+    The REST endpoint actually answers in JSON (seen 2026-10-26):
+        {"success":true,"result":1,"resultJSON":"[]","errDesc":""}
+    Their docs describe plain text instead ("1" on success, else an error text), so both are read.
+    """
+    text = body.strip()
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        if data.get("success") is True:
+            # Sent. Credits are informational; never call a sent SMS a failure (a retry
+            # would send it again).
+            return True, parse_credits(data.get("result")), ""
+        return False, None, str(data.get("errDesc") or "").strip()
+    if isinstance(data, str):  # a JSON-quoted plain answer, e.g. "\"1\""
+        text = data.strip()
+    credits = parse_credits(text)
+    if credits is not None:
+        return True, credits, ""
+    return False, None, text
 
 
 class GlobalSmsSender:
@@ -155,10 +185,20 @@ class GlobalSmsSender:
         if response.status_code != 200:
             raise SmsSendError(f"http_{response.status_code // 100}xx")
 
-        answer = response.text.strip()
-        credits = parse_credits(answer)
-        if credits is None:
-            raise SmsSendError(_GLOBALSMS_ERRORS.get(answer.lower(), "unexpected_response"))
+        accepted, credits, error = read_answer(response.text)
+        if not accepted:
+            status = _GLOBALSMS_ERRORS.get(error.lower(), "unexpected_response")
+            if status == "unexpected_response":
+                # Safe to log: this endpoint answers with credits or an error text, never the key,
+                # phone or code. Long digit runs are masked anyway, just in case.
+                log.warning(
+                    "globalsms unexpected answer",
+                    extra={
+                        "content_type": response.headers.get("content-type", ""),
+                        "preview": re.sub(r"[0-9]{7,}", "***", response.text[:80]),
+                    },
+                )
+            raise SmsSendError(status)
         log.info("globalsms accepted", extra={"message_id": message_id, "credits": credits})
         return message_id
 
