@@ -295,7 +295,13 @@ def globalsms_answering(status: int, text: str, seen: list[httpx.Request]) -> Gl
         seen.append(request)
         return httpx.Response(status, text=text)
 
-    return GlobalSmsSender("secret-api-key", "MyApp", 5, transport=httpx.MockTransport(handler))
+    return GlobalSmsSender(
+        api_key="secret-api-key",
+        originator="MyApp",
+        base_url="https://sms.test",
+        timeout_seconds=5,
+        transport=httpx.MockTransport(handler),
+    )
 
 
 async def test_globalsms_end_to_end(app: FastAPI, caplog: pytest.LogCaptureFixture) -> None:
