@@ -308,7 +308,8 @@ async def test_globalsms_end_to_end(app: FastAPI, caplog: pytest.LogCaptureFixtu
     logging.getLogger().addHandler(caplog.handler)  # create_app() replaced the root handlers
     caplog.set_level(logging.DEBUG)
     seen: list[httpx.Request] = []
-    app.state.sms = globalsms_answering(200, "1", seen)  # closed by the app's shutdown
+    real_answer = '{"success":true,"result":1,"resultJSON":"[]","errDesc":""}'  # seen live
+    app.state.sms = globalsms_answering(200, real_answer, seen)  # closed by the app's shutdown
 
     status, _ = await request_code(app)
     assert status == 202
