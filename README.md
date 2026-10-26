@@ -4,7 +4,7 @@ Sign-up and login with a phone number and an SMS code. It issues the tokens that
 service (chat-service first) uses to know **who** is calling and **from which device**.
 
 > **Status: first endpoint.** Structure, tooling, logging, database, migrations, tests and CI are in
-> place, and `POST /auth/otp/request` sends codes (fake sender, or Global SMS via `SMS_PROVIDER`). Feature endpoints are added step by step
+> place, and `POST /auth/otp/request` sends real SMS codes (Global SMS). Feature endpoints are added step by step
 > (see [Build plan](#13-build-plan)).
 
 ---
@@ -392,16 +392,15 @@ Each step is small, tested and deployed before the next.
 1. ✅ **Skeleton**: structure, tooling, JSON logs, DB pool, Alembic, tests, CI, Docker.
 2. ✅ First tables (`users`, `devices`, `otp_challenges`) + migration 0001 + database tests (CI runs a Postgres);
    migrations run in the cluster by the `migrate` init container (`k8s/auth.yaml`).
-3. ✅ `POST /auth/otp/request` with a **fake SMS sender** (₪0) + per-phone/per-IP limits (Redis) + daily
-   SMS cap (Postgres) + OTP cleanup job + error shape + client-IP fix (deployed).
-   🔨 Real provider: Global SMS behind `SMS_PROVIDER=globalsms` (code ready; prod switch in `k8s/auth.yaml`).
+3. ✅ `POST /auth/otp/request` + per-phone/per-IP limits (Redis) + daily SMS cap (Postgres) + OTP cleanup
+   job + error shape + client-IP fix. Real SMS via Global SMS (`SMS_PROVIDER=globalsms` in prod; `fake`
+   locally and in CI). Verified in prod 2026-10-26: code SMS received, spoofed `X-Forwarded-For` ignored.
 4. `POST /auth/otp/verify` → user + device.
 5. Signing keys + access tokens + `jwks.json`.
 6. Refresh tokens: issue, rotate, reuse detection, logout, devices list/remove.
 7. Tracing (OpenTelemetry → Tempo) + metrics.
 8. Dummy Expo app against it (PLAN.md phase 8).
-9. ~~Real SMS provider~~: moved into step 3 (decided 2026-10-22): Global SMS, a plain SMS API behind `SMS_PROVIDER`,
-   with the owner's per-provider settings in `config.py`.
+9. ✅ Real SMS provider: done as part of step 3 (Global SMS, per-provider settings in `config.py`).
 
 ## 14. Deployment
 - Push to `main` → GitHub Actions (ARM runner): checks → image
