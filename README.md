@@ -325,7 +325,8 @@ Later: `device_links` for linking secondary devices by QR code (PLAN.md, "Later"
 | `SMS_PROVIDER` | `fake` | `fake` (sends nothing) or `globalsms` |
 | `FAKE_SMS_DAILY_CAP` | `100` | Daily SMS cap while the fake provider is active |
 | `GLOBALSMS_API_KEY` | – | Global SMS key. In the cluster: sealed Secret `auth-sms` |
-| `GLOBALSMS_ORIGINATOR` | – (default in `config.py` once approved) | Approved sender name/number, max 11 chars |
+| `GLOBALSMS_ORIGINATOR` | `ZviaginChat` | Approved sender name/number, max 11 chars |
+| `GLOBALSMS_BASE_URL` | `https://sapi.itnewsletter.co.il` | Their host without an IP allow-list |
 | `GLOBALSMS_DAILY_CAP` / `GLOBALSMS_TIMEOUT_SECONDS` | `100` / `5` | Daily cap / whole-request timeout |
 
 **SMS providers.** Each provider has its own settings block in `config.py` (`FakeSmsSettings`,
@@ -336,12 +337,14 @@ the only place that knows provider names; a provider that isn't fully configured
 `otp/request` answers 503 (never a silent fallback to fake). Adding a provider = a class with `name`,
 `send()` and `aclose()` (the `SmsSender` Protocol), its settings block, and one `case`.
 
-**Global SMS** (`GlobalSmsSender`): `POST https://api.itnewsletter.co.il/api/restApiSms/sendSmsToRecipients`
+**Global SMS** (`GlobalSmsSender`): `POST <GLOBALSMS_BASE_URL>/api/restApiSms/sendSmsToRecipients`
 with a JSON body (`ApiKey`, `txtOriginator`, `destinations` as `05XXXXXXXX`, `txtSMSmessage`, `txtAddInf` =
 our 14-char message id, which shows up in their delivery reports). Success is a number (credits charged);
 errors are plain-text strings, mapped to fixed status codes (`invalid_login`, `not_enough_credit`,
-`unapproved_originator`, `http_403`, `timeout`, …) that are safe to log. Only approved caller IPs may use
-their API (HTTP 403 otherwise). An English code message is 1 credit (up to 160 characters).
+`unapproved_originator`, `http_403`, `timeout`, …) that are safe to log. We use their `sapi` host, which
+has no IP allow-list (their `api` host only accepts approved IPs), so the API key alone authorizes sending:
+keep it secret. An English code message is 1 credit (up to 160 characters). Verified with a real send on
+2026-10-26: JSON body on `sapi`, sender `ZviaginChat`, recipient format `05XXXXXXXX`.
 
 More settings are added with the steps that need them (token lifetimes, signing key, SMS provider credentials).
 
@@ -389,7 +392,7 @@ Each step is small, tested and deployed before the next.
    migrations run in the cluster by the `migrate` init container (`k8s/auth.yaml`).
 3. ✅ `POST /auth/otp/request` with a **fake SMS sender** (₪0) + per-phone/per-IP limits (Redis) + daily
    SMS cap (Postgres) + OTP cleanup job + error shape + client-IP fix (deployed).
-   🔨 Real provider: Global SMS behind `SMS_PROVIDER=globalsms` (waiting for the approved sender).
+   🔨 Real provider: Global SMS behind `SMS_PROVIDER=globalsms` (code ready; prod switch in `k8s/auth.yaml`).
 4. `POST /auth/otp/verify` → user + device.
 5. Signing keys + access tokens + `jwks.json`.
 6. Refresh tokens: issue, rotate, reuse detection, logout, devices list/remove.

@@ -69,9 +69,9 @@ class FakeSmsSender:
         return None
 
 
-# ---- Global SMS (api.itnewsletter.co.il) ----
+# ---- Global SMS (itnewsletter.co.il) ----
 
-GLOBALSMS_SEND_URL = "https://api.itnewsletter.co.il/api/restApiSms/sendSmsToRecipients"
+GLOBALSMS_SEND_PATH = "/api/restApiSms/sendSmsToRecipients"  # after the host (base_url setting)
 
 # The provider answers in plain text: a number (credits charged) on success, otherwise one of these.
 # Keys are lower-cased; values are our status codes, safe to log.
@@ -110,22 +110,26 @@ def parse_credits(text: str) -> float | None:
 class GlobalSmsSender:
     """Sends through Global SMS's REST API. JSON body: the API key travels in the body, not the URL.
 
-    One HTTP client (connection pool) for the life of the process, like a shared axios instance.
-    Their API only accepts calls from approved IP addresses (HTTP 403 otherwise).
+    One HTTP client (connection pool) for the life of the process, like a shared axios instance
+    created with a baseURL. HTTP 403 means the caller isn't allowed (e.g. an IP-restricted host).
     """
 
     name = "globalsms"
 
     def __init__(
         self,
+        *,  # keyword-only: GlobalSmsSender(api_key=..., originator=..., ...)
         api_key: str,
         originator: str,
+        base_url: str,
         timeout_seconds: float,
         transport: httpx.AsyncBaseTransport | None = None,  # tests pass a mock here
     ) -> None:
         self._api_key = api_key
         self._originator = originator
-        self._client = httpx.AsyncClient(timeout=timeout_seconds, transport=transport)
+        self._client = httpx.AsyncClient(
+            base_url=base_url, timeout=timeout_seconds, transport=transport
+        )
 
     async def send(self, phone_e164: str, text: str) -> str:
         # Our own id for this message (max 15 chars allowed); it appears as "Inf" in their
@@ -140,14 +144,14 @@ class GlobalSmsSender:
         }
         # `from None` drops httpx's original exception, whose text can include the request.
         try:
-            response = await self._client.post(GLOBALSMS_SEND_URL, json=payload)
+            response = await self._client.post(GLOBALSMS_SEND_PATH, json=payload)
         except httpx.TimeoutException:
             raise SmsSendError("timeout") from None
         except httpx.HTTPError:
             raise SmsSendError("network_error") from None
 
         if response.status_code == 403:
-            raise SmsSendError("http_403")  # caller IP not approved, or no API permission
+            raise SmsSendError("http_403")  # no API permission (or an IP-restricted host)
         if response.status_code != 200:
             raise SmsSendError(f"http_{response.status_code // 100}xx")
 
@@ -180,5 +184,8 @@ def make_sms_sender(settings: Settings) -> SmsSender | None:
                 )
                 return None
             return GlobalSmsSender(
-                cfg.api_key.get_secret_value(), cfg.originator, cfg.timeout_seconds
+                api_key=cfg.api_key.get_secret_value(),
+                originator=cfg.originator,
+                base_url=cfg.base_url,
+                timeout_seconds=cfg.timeout_seconds,
             )

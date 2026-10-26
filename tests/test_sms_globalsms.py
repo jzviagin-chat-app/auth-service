@@ -13,7 +13,7 @@ from pydantic import SecretStr
 from auth_service.config import GlobalSmsSettings, Settings
 from auth_service.core.logging import JsonFormatter, setup_logging
 from auth_service.services.sms import (
-    GLOBALSMS_SEND_URL,
+    GLOBALSMS_SEND_PATH,
     FakeSmsSender,
     GlobalSmsSender,
     SmsSendError,
@@ -23,7 +23,18 @@ from auth_service.services.sms import (
 )
 
 API_KEY = "test-api-key-123"
+BASE_URL = "https://sms.test"
 PHONE = "+972501234567"
+
+
+def make_sender(transport: httpx.MockTransport) -> GlobalSmsSender:
+    return GlobalSmsSender(
+        api_key=API_KEY,
+        originator="MyApp",
+        base_url=BASE_URL,
+        timeout_seconds=5,
+        transport=transport,
+    )
 
 
 def sender_answering(
@@ -36,14 +47,14 @@ def sender_answering(
             seen.append(request)
         return httpx.Response(status, text=text)
 
-    return GlobalSmsSender(API_KEY, "MyApp", 5, transport=httpx.MockTransport(handler))
+    return make_sender(httpx.MockTransport(handler))
 
 
 def sender_raising(exc: type[httpx.HTTPError]) -> GlobalSmsSender:
     def handler(request: httpx.Request) -> httpx.Response:
         raise exc("simulated", request=request)
 
-    return GlobalSmsSender(API_KEY, "MyApp", 5, transport=httpx.MockTransport(handler))
+    return make_sender(httpx.MockTransport(handler))
 
 
 async def send_status(sender: GlobalSmsSender) -> str:
@@ -65,7 +76,7 @@ async def test_request_sent_as_documented() -> None:
 
     [request] = seen
     assert request.method == "POST"
-    assert str(request.url) == GLOBALSMS_SEND_URL  # the key is not in the URL
+    assert str(request.url) == BASE_URL + GLOBALSMS_SEND_PATH  # the key is not in the URL
     assert json.loads(request.content) == {
         "ApiKey": API_KEY,
         "txtOriginator": "MyApp",
@@ -230,3 +241,10 @@ def test_daily_cap_is_the_active_providers() -> None:
 def test_originator_max_11_chars() -> None:
     with pytest.raises(ValueError, match="at most 11 characters"):
         GlobalSmsSettings(originator="TwelveChars1")
+
+
+def test_globalsms_defaults() -> None:
+    # Plain provider settings live here, in code (only the API key comes from the cluster).
+    cfg = GlobalSmsSettings()
+    assert cfg.base_url == "https://sapi.itnewsletter.co.il"  # their host without an IP allow-list
+    assert cfg.originator == "ZviaginChat"  # the approved sender

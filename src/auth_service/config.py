@@ -26,15 +26,16 @@ class FakeSmsSettings(BaseSettings):
 
 
 class GlobalSmsSettings(BaseSettings):
-    """Provider "globalsms": Global SMS, api.itnewsletter.co.il. Env: GLOBALSMS_*."""
+    """Provider "globalsms": Global SMS (itnewsletter.co.il). Env: GLOBALSMS_*."""
 
     model_config = SettingsConfigDict(env_prefix="GLOBALSMS_", env_file=".env", extra="ignore")
 
     # GLOBALSMS_API_KEY <- sealed Secret "auth-sms" (k8s/auth.yaml in chat-infra).
     api_key: SecretStr | None = None
-    # Sender shown to recipients: a name or number pre-approved in the Global SMS account (max 11
-    # characters). Set the default here once it's approved; until then the provider can't be used.
-    originator: str | None = Field(default=None, max_length=11)
+    # "sapi" is their host without an IP allow-list (Global SMS's advice, verified 2026-10-26).
+    base_url: str = "https://sapi.itnewsletter.co.il"
+    # Sender shown to recipients: pre-approved in the Global SMS account (max 11 characters).
+    originator: str | None = Field(default="ZviaginChat", max_length=11)
     daily_cap: PositiveInt = 100  # GLOBALSMS_DAILY_CAP
     timeout_seconds: PositiveFloat = 5  # the whole request, so a slow provider can't hang requests
 
