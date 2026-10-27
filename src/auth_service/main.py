@@ -17,6 +17,7 @@ from auth_service.api.router import api_router
 from auth_service.config import get_settings
 from auth_service.core.logging import setup_logging
 from auth_service.db.engine import Database
+from auth_service.services.keys import make_signing_keys
 from auth_service.services.otp import cleanup_loop
 from auth_service.services.sms import make_sms_sender
 
@@ -27,6 +28,8 @@ log = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Runs once per process: code before `yield` at startup, after `yield` at shutdown."""
     settings = get_settings()
+    # Signing keys first: a broken JWT_PRIVATE_KEY raises here, so the pod never starts half-ready.
+    app.state.keys = make_signing_keys(settings)
     app.state.db = None
     app.state.redis = None
     app.state.sms = make_sms_sender(settings)

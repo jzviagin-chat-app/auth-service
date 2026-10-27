@@ -107,10 +107,12 @@ auth-service/
 │   │   ├── otp.py          #   /auth/otp/request ✅, /auth/otp/verify (step 4)
 │   │   ├── tokens.py       #   (empty) /auth/token/refresh, /auth/logout
 │   │   ├── devices.py      #   (empty) /auth/devices
-│   │   └── jwks.py         #   (empty) /auth/.well-known/jwks.json
+│   │   └── jwks.py         #   /auth/.well-known/jwks.json ✅
 │   ├── services/           # business logic
 │   │   ├── otp.py          #   request a code: validation, hashing, the flow, cleanup job
 │   │   ├── rate_limit.py   #   per-phone / per-IP limits in Redis
+│   │   ├── keys.py         #   Ed25519 signing keys, kid (RFC 7638 thumbprint), JWKS document
+│   │   ├── tokens.py       #   issue / verify access tokens (JWT, EdDSA)
 │   │   └── sms.py          #   SmsSender interface, FakeSmsSender, GlobalSmsSender, make_sms_sender()
 │   ├── db/
 │   │   ├── engine.py       #   connection pool + sessions (Database class)
@@ -210,8 +212,18 @@ Later each line also gets `trace_id`, linked to its trace in Tempo.
   15 minutes. chat-service can also check a Redis "revoked devices" set when the socket connects.
 - **WebSocket (chat-service):** connect, then send `{"type":"auth","token":"<access>"}` within 5 s.
   The token is never put in the URL, because URLs end up in logs.
-- **Signing keys:** an Ed25519 key pair from a SealedSecret. `jwks.json` publishes the current and the
-  previous public key, so keys can be rotated without logging anyone out.
+- **Signing keys** (`services/keys.py`): an Ed25519 private key (PEM) in `JWT_PRIVATE_KEY` from the sealed
+  Secret `auth-jwt`. Each key's `kid` is its RFC 7638 thumbprint (a hash of the public key), so a new key
+  gets a new id automatically. `jwks.json` publishes the current public key and, during a rotation, the
+  previous one. A broken key stops the pod from starting; no key in prod → token endpoints and `jwks.json`
+  answer 503; no key with `ENVIRONMENT=dev` → a throwaway key is generated at startup.
+- **Key rotation:** generate a new key; set `JWT_PRIVATE_KEY` to it and `JWT_PREVIOUS_PUBLIC_KEY` to the old
+  *public* key; deploy (new tokens use the new key, old tokens still verify). After 15 min plus consumers'
+  JWKS cache (5 min), remove `JWT_PREVIOUS_PUBLIC_KEY`. Nobody is logged out (refresh tokens don't depend
+  on the signing key).
+- **Verifying** (`services/tokens.verify_access_token`, the reference for every consumer): algorithm fixed to
+  `EdDSA`, key chosen by `kid` from the published keys only, `iss` checked, all claims required, 30 s leeway
+  for clock differences. Never trust the token's own `alg` or embedded keys.
 - **Web client later:** the refresh token goes in an `HttpOnly; Secure; SameSite=Strict` cookie scoped
   to `/auth/token/refresh`, and the access token is kept in memory only.
 
@@ -229,7 +241,7 @@ and mobile apps don't handle cookies well. Why not one long-lived JWT: it can't 
 | POST | `/auth/logout` | access token | Revoke this device's refresh chain |
 | GET | `/auth/devices` | access token | List my devices |
 | DELETE | `/auth/devices/{id}` | access token | Sign a device out |
-| GET | `/auth/.well-known/jwks.json` | – | Public keys for verifying access tokens |
+| GET | `/auth/.well-known/jwks.json` | – | Public keys for verifying access tokens ✅ (`Cache-Control: public, max-age=300`) |
 | GET | `/auth/docs` | – | Interactive API docs, **dev only** |
 
 Errors use one shape everywhere: `{"error": "<code>", "message": "<human text>"}`. Clients branch on
@@ -348,7 +360,11 @@ has no IP allow-list (their `api` host only accepts approved IPs), so the API ke
 keep it secret. An English code message is 1 credit (up to 160 characters). Verified with a real send on
 2026-10-26: JSON body on `sapi`, sender `ZviaginChat`, recipient format `05XXXXXXXX`.
 
-More settings are added with the steps that need them (token lifetimes, signing key, SMS provider credentials).
+| `JWT_PRIVATE_KEY` | – | Ed25519 private key (PEM) that signs access tokens. Sealed Secret `auth-jwt` |
+| `JWT_PREVIOUS_PUBLIC_KEY` | – | Previous public key (PEM), only during a key rotation |
+| `JWT_ISSUER` / `ACCESS_TOKEN_TTL_SECONDS` | `auth-service` / `900` | `iss` claim / access-token lifetime |
+
+More settings are added with the steps that need them (refresh-token lifetime).
 
 ## 12. Everyday commands
 
@@ -395,8 +411,9 @@ Each step is small, tested and deployed before the next.
 3. ✅ `POST /auth/otp/request` + per-phone/per-IP limits (Redis) + daily SMS cap (Postgres) + OTP cleanup
    job + error shape + client-IP fix. Real SMS via Global SMS (`SMS_PROVIDER=globalsms` in prod; `fake`
    locally and in CI). Verified in prod 2026-10-26: code SMS received, spoofed `X-Forwarded-For` ignored.
-4. `POST /auth/otp/verify` → user + device.
-5. Signing keys + access tokens + `jwks.json`.
+5. ✅ Signing keys + access tokens + `jwks.json` (built before step 4, so verify returns real tokens).
+4. 🔨 `POST /auth/otp/verify` + `POST /auth/register` (Telegram-like: a new phone gets a registration token
+   and must send a display name before a user exists).
 6. Refresh tokens: issue, rotate, reuse detection, logout, devices list/remove.
 7. Tracing (OpenTelemetry → Tempo) + metrics.
 8. Dummy Expo app against it (PLAN.md phase 8).

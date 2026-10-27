@@ -78,6 +78,16 @@ class Settings(BaseSettings):
     otp_retention_hours: PositiveInt = 24  # older otp_challenges rows are deleted
     otp_cleanup_interval_seconds: PositiveInt = 3600
 
+    # ---- access tokens (JWT signed with Ed25519 / "EdDSA") ----
+    # PEM of the private key that signs access tokens. JWT_PRIVATE_KEY <- sealed Secret "auth-jwt".
+    # Unset: prod issues no tokens (503); ENVIRONMENT=dev uses a throwaway key made at startup.
+    jwt_private_key: SecretStr | None = None
+    # PEM of the previous public key, only during a key rotation (JWT_PREVIOUS_PUBLIC_KEY, same
+    # Secret): tokens signed with the old key stay valid until they expire.
+    jwt_previous_public_key: str | None = None
+    jwt_issuer: str = "auth-service"  # the "iss" claim; consumers check it
+    access_token_ttl_seconds: PositiveInt = 900  # 15 minutes
+
     # Which SMS provider sends the codes. Each one has its own settings block (above).
     sms_provider: Literal["fake", "globalsms"] = "fake"
     fake_sms: FakeSmsSettings = Field(default_factory=FakeSmsSettings)
