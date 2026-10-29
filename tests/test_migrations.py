@@ -112,3 +112,32 @@ async def test_sms_daily_usage_never_negative(session: AsyncSession) -> None:
     session.add(SmsDailyUsage(day=date(2026, 10, 22), sent=-1))
     with pytest.raises(IntegrityError, match="ck_sms_daily_usage_sent_non_negative"):
         await session.commit()
+
+
+async def test_one_active_primary_device_per_user(session: AsyncSession) -> None:
+    user = User(phone_e164="+972501234567")
+    session.add(user)
+    await session.flush()
+    revoked = datetime.now(UTC)
+    session.add_all(
+        [
+            Device(user_id=user.id, platform="ios"),  # role defaults to primary
+            Device(user_id=user.id, platform="ios", revoked_at=revoked),  # revoked: doesn't count
+            Device(user_id=user.id, platform="web", role="linked"),  # linked: doesn't count
+            Device(user_id=user.id, platform="web", role="linked"),
+        ]
+    )
+    await session.commit()
+
+    session.add(Device(user_id=user.id, platform="android"))  # a second active primary
+    with pytest.raises(IntegrityError, match="uq_devices_one_active_primary"):
+        await session.commit()
+
+
+async def test_device_role_is_checked(session: AsyncSession) -> None:
+    user = User(phone_e164="+972501234567")
+    session.add(user)
+    await session.flush()
+    session.add(Device(user_id=user.id, platform="ios", role="admin"))
+    with pytest.raises(IntegrityError, match="ck_devices_role_valid"):
+        await session.commit()

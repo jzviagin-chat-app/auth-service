@@ -22,6 +22,7 @@ from sqlalchemy import (
     SmallInteger,
     String,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import INET
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -69,11 +70,21 @@ class User(Base):
 
 
 class Device(Base):
-    """One installed app (phone, later a browser). A user can have several."""
+    """One installed app. WhatsApp model (PLAN.md section 6): one `primary` device per user, a
+    phone logged in by SMS; a new SMS login revokes the old primary. `linked` (QR) in step 10."""
 
     __tablename__ = "devices"
     __table_args__ = (
         CheckConstraint("platform IN ('ios', 'android', 'web')", name="platform_valid"),
+        CheckConstraint("role IN ('primary', 'linked')", name="role_valid"),
+        # At most one active primary per user, enforced by Postgres: two SMS logins racing can't
+        # both win (the second INSERT fails). Revoked or linked rows don't count.
+        Index(
+            "uq_devices_one_active_primary",
+            "user_id",
+            unique=True,
+            postgresql_where=text("role = 'primary' AND revoked_at IS NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid7)
@@ -81,6 +92,7 @@ class Device(Base):
         ForeignKey("users.id", ondelete="CASCADE"), index=True
     )
     platform: Mapped[str] = mapped_column(String(16))
+    role: Mapped[str] = mapped_column(String(16), server_default="primary")
     name: Mapped[str | None] = mapped_column(String(100))  # e.g. "Jacob's iPhone"
     created_at: Mapped[datetime] = _now()
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -108,6 +120,10 @@ class OtpChallenge(Base):
     attempts: Mapped[int] = mapped_column(SmallInteger, server_default="0")
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     request_ip: Mapped[str | None] = mapped_column(INET)
+    # Set when a correct code arrives for a phone with no account yet: SHA-256 of the registration
+    # token the app must send to POST /auth/register (with a display name). Cleared once used.
+    registration_token_hash: Mapped[bytes | None] = mapped_column(LargeBinary(32), unique=True)
+    registration_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class SmsDailyUsage(Base):

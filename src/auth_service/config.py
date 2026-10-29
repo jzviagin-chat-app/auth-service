@@ -76,7 +76,8 @@ class Settings(BaseSettings):
     otp_ip_max_per_hour: PositiveInt = 30
     otp_ip_max_per_day: PositiveInt = 200
     otp_retention_hours: PositiveInt = 24  # older otp_challenges rows are deleted
-    otp_cleanup_interval_seconds: PositiveInt = 3600
+    otp_cleanup_interval_seconds: PositiveInt = 3600  # how often the cleanup job runs
+    device_retention_days: PositiveInt = 30  # revoked devices are deleted after this
 
     # ---- access tokens (JWT signed with Ed25519 / "EdDSA") ----
     # PEM of the private key that signs access tokens. JWT_PRIVATE_KEY <- sealed Secret "auth-jwt".

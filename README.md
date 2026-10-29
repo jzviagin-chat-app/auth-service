@@ -3,8 +3,8 @@
 Sign-up and login with a phone number and an SMS code. It issues the tokens that every other
 service (chat-service first) uses to know **who** is calling and **from which device**.
 
-> **Status: first endpoint.** Structure, tooling, logging, database, migrations, tests and CI are in
-> place, and `POST /auth/otp/request` sends real SMS codes (Global SMS). Feature endpoints are added step by step
+> **Status: sign-up and login.** `POST /auth/otp/request` sends real SMS codes (Global SMS),
+> `otp/verify` + `register` log users in with access tokens. Refresh tokens and the rest are added step by step
 > (see [Build plan](#13-build-plan)).
 
 ---
@@ -95,7 +95,8 @@ auth-service/
 ├── alembic/
 │   ├── env.py              # reads DATABASE_URL, uses our models' metadata
 │   ├── script.py.mako      # template for new migration files
-│   └── versions/           # one file per migration (0001 tables, 0002 sms_daily_usage)
+│   └── versions/           # one file per migration (0001 tables, 0002 sms_daily_usage,
+│                           #   0003 registration token, 0004 device role)
 ├── src/auth_service/
 │   ├── main.py             # app factory: create_app(), lifespan (startup/shutdown), routers
 │   ├── config.py           # Settings from env vars (pydantic-settings), get_settings()
@@ -103,13 +104,19 @@ auth-service/
 │   │   ├── health.py       #   /healthz, /auth/healthz
 │   │   ├── router.py       #   mounts all feature routers under /auth
 │   │   ├── errors.py       #   the {"error", "message"} shape for every error
-│   │   ├── deps.py         #   dependencies routes receive (DbSession, OtpContextDep)
-│   │   ├── otp.py          #   /auth/otp/request ✅, /auth/otp/verify (step 4)
+│   │   ├── deps.py         #   dependencies routes receive (DbSession, OtpContextDep, LoginContextDep)
+│   │   ├── otp.py          #   /auth/otp/request ✅, /auth/otp/verify ✅
+│   │   ├── register.py     #   /auth/register ✅
+│   │   ├── schemas.py      #   bodies shared by routes (DeviceIn, LoggedInOut)
 │   │   ├── tokens.py       #   (empty) /auth/token/refresh, /auth/logout
 │   │   ├── devices.py      #   (empty) /auth/devices
 │   │   └── jwks.py         #   /auth/.well-known/jwks.json ✅
 │   ├── services/           # business logic
-│   │   ├── otp.py          #   request a code: validation, hashing, the flow, cleanup job
+│   │   ├── otp.py          #   request a code: validation, hashing, the flow
+│   │   ├── login.py        #   otp/verify: check a code → logged in / registration required
+│   │   ├── registration.py #   registration token, register (new user + primary device)
+│   │   ├── devices.py      #   shared by both: device info, phones only, replace the primary device
+│   │   ├── cleanup.py      #   hourly job: old OTP rows, long-revoked devices
 │   │   ├── rate_limit.py   #   per-phone / per-IP limits in Redis
 │   │   ├── keys.py         #   Ed25519 signing keys, kid (RFC 7638 thumbprint), JWKS document
 │   │   ├── tokens.py       #   issue / verify access tokens (JWT, EdDSA)
@@ -128,6 +135,8 @@ auth-service/
     ├── test_client_ip.py   # X-Forwarded-For handling behind the ingress
     ├── test_otp_units.py   # pure OTP helpers
     ├── test_otp_request.py # POST /auth/otp/request against real Postgres + Redis
+    ├── test_otp_verify.py  # POST /auth/otp/verify + /auth/register against real Postgres
+    ├── test_tokens.py      # signing keys, access tokens, jwks.json
     └── test_migrations.py  # migrations + constraints against real Postgres
 ```
 
@@ -202,8 +211,20 @@ Later each line also gets `trace_id`, linked to its trace in Tempo.
 `kid` in the header (which key signed it).
 
 **Flows**
-- **Sign up / log in:** `otp/request {phone}` → SMS code → `otp/verify {phone, code, device info}`
-  → find or create the user, register the device → `{access, refresh}`.
+- **Devices (WhatsApp model, PLAN.md §6):** each user has **one primary device**, a phone (`ios` / `android`)
+  logged in by SMS. **A new SMS login replaces it:** in one transaction the old primary is revoked
+  (`revoked_at`; its refresh tokens too, from step 6) and the new device is created. A re-login on the same
+  phone (reinstall, wiped app) is the same case: the server can't recognise a reinstalled app, so it is a new
+  device. Why: whoever gets hold of a code (SIM swap, phishing) signs the real owner out, so a takeover is
+  noticed instead of an extra device silently reading along. Browsers and tablets will be **linked** devices,
+  added by QR from the primary (step 10; up to 4).
+- **Log in (known number):** `otp/request {phone}` → SMS code → `otp/verify {phone, code, device}` →
+  the old primary revoked, a new primary device → `logged_in` + access token.
+- **Sign up (new number, Telegram-like):** the same `otp/verify` answers `registration_required` with a
+  registration token (random 256 bits, only its SHA-256 stored on the `otp_challenges` row, 10 min, single
+  use) → `register {registration_token, display_name, device}` → user + device → `logged_in`. No user row
+  exists before a display name is sent. The app keeps the registration token in memory only.
+- Until step 6 only the access token is returned; `refresh_token` is added then.
 - **Refresh (rotation):** `token/refresh {refresh}` → the old token is marked used → returns a **new**
   pair in the same chain.
 - **Reuse detection:** if an already-used refresh token is presented again, it was copied. Revoke the
@@ -236,7 +257,8 @@ and mobile apps don't handle cookies well. Why not one long-lived JWT: it can't 
 |---|---|---|---|
 | GET | `/healthz`, `/auth/healthz` | – | Health checks ✅ |
 | POST | `/auth/otp/request` | – | Send an SMS code ✅. Same `202` for every number, registered or not. Rate limited (below) |
-| POST | `/auth/otp/verify` | – | Check the code → user + device + tokens |
+| POST | `/auth/otp/verify` | – | Check the code → logged in, or registration required ✅ |
+| POST | `/auth/register` | registration token | New number: display name → user + device + token ✅ |
 | POST | `/auth/token/refresh` | refresh token | Rotate → new pair |
 | POST | `/auth/logout` | access token | Revoke this device's refresh chain |
 | GET | `/auth/devices` | access token | List my devices |
@@ -269,6 +291,36 @@ Flow (`api/otp.py` → `services/otp.py`):
    transaction.
 4. Send after the commit, so no code reaches a phone unless it can be verified.
 
+**`POST /auth/otp/verify`** `{"phone": "+972501234567", "code": "123456", "device": {"platform": "ios", "name": "Jacob's iPhone"}}`
+(`platform`: `ios` or `android`, `web` is answered 400; `name` optional, max 100)
+
+| Answer | When |
+|---|---|
+| `200 {"status": "logged_in", "access_token", "token_type": "Bearer", "expires_in": 900, "user_id", "device_id"}` | Right code, the number has an account: this phone becomes the primary device, the previous one is signed out |
+| `200 {"status": "registration_required", "registration_token", "expires_in": 600}` | Right code, new number → call `register` |
+| `400 invalid_code` | Wrong code; retry (the message says how many tries are left) |
+| `400 code_expired` | No usable code: none sent, expired, already used, or the 5th wrong try → request a new one |
+| `400 invalid_phone` / `422 invalid_request` | Bad number / malformed body (the code must be 6 digits) |
+| `400 unsupported_platform` | `platform` is `web`: SMS login is for phones only (nothing is used up) |
+| `403 account_blocked` | The user's status is `blocked` (the code is used up) |
+| `409 login_conflict` | Another login of the same user won a race twice in a row; retry with the same code (nothing is used up) |
+| `503 tokens_unavailable` | No signing key or OTP pepper configured (nothing is used up) |
+
+Only the **newest** code for a number counts: a resend cancels the previous one. The challenge row is locked
+(`SELECT … FOR UPDATE`), so parallel requests can't use one code twice or skip the attempt count. Guessing is
+bounded by 5 tries per code × 10 codes a day per number (the `otp/request` limits).
+
+**`POST /auth/register`** `{"registration_token": "...", "display_name": "Jacob", "device": {...}}`
+(`display_name` trimmed, 1–50 characters)
+
+| Answer | When |
+|---|---|
+| `201` same body as `logged_in` | User and its primary device created |
+| `400 unsupported_platform` | `platform` is `web` (the token stays usable) |
+| `401 invalid_registration_token` | Unknown, expired (10 min) or already used → verify the number again |
+| `409 already_registered` | The number got an account meanwhile (e.g. another device registered first) → log in |
+| `503 tokens_unavailable` | As above |
+
 **Client IP:** `request.client.host` comes from `X-Forwarded-For`, believed only from `TRUSTED_PROXIES`
 (the ingress in the pod network `10.42.0.0/16`). HAProxy appends to whatever the client sent, so the app
 takes the rightmost untrusted address (uvicorn's `ProxyHeadersMiddleware`, added in `create_app()`;
@@ -276,20 +328,22 @@ the Dockerfile runs uvicorn with `--no-proxy-headers`).
 
 ## 9. Data model
 
-In `db/models.py`; migration `0001_initial.py` creates the first three tables, `0002_sms_daily_usage.py` the cap.
+In `db/models.py`; migration `0001_initial.py` creates the first three tables, `0002_sms_daily_usage.py` the cap,
+`0003_registration_token.py` the registration-token columns, `0004_device_role.py` `devices.role` + the
+one-active-primary index.
 IDs are UUIDv7 generated by the app (no database default). All times are `timestamptz`.
 
 | Table | Key columns | Notes |
 |---|---|---|
 | `users` ✅ | `id uuid PK`, `phone_e164 varchar(16) UNIQUE`, `display_name varchar(50)`, `avatar_key varchar(200)`, `status` (`active`/`blocked`), `created_at` | E.164 enforced by a check constraint (`+972501234567`). `avatar_key` = object-storage key, served via short-lived signed URLs. Hard delete (cascades to devices) |
-| `devices` ✅ | `id uuid PK`, `user_id FK → users ON DELETE CASCADE`, `platform` (`ios`/`android`/`web`), `name`, `created_at`, `last_seen_at`, `revoked_at` | One row per installed app. `public_key` added with E2E |
-| `otp_challenges` ✅ | `id`, `phone_e164`, `code_hash bytea`, `created_at`, `expires_at`, `attempts`, `consumed_at`, `request_ip inet`; index `(phone_e164, created_at)` | Keyed by phone, not user: the code is sent before the user exists. Valid 5 min, max 5 attempts, single use; rows deleted after 24 h |
+| `devices` ✅ | `id uuid PK`, `user_id FK → users ON DELETE CASCADE`, `platform` (`ios`/`android`/`web`), `role` (`primary`/`linked`, default `primary`), `name`, `created_at`, `last_seen_at`, `revoked_at`; partial unique index `(user_id) WHERE role = 'primary' AND revoked_at IS NULL` | One row per app installation (a login). At most one active primary per user, enforced by Postgres. `last_seen_at` is set at login (and on token refresh from step 6), never per API call. Revoked rows are deleted after 30 days. `public_key` added with E2E |
+| `otp_challenges` ✅ | `id`, `phone_e164`, `code_hash bytea`, `created_at`, `expires_at`, `attempts`, `consumed_at`, `request_ip inet`, `registration_token_hash bytea UNIQUE`, `registration_expires_at`; index `(phone_e164, created_at)` | Keyed by phone, not user: the code is sent before the user exists. Valid 5 min, max 5 attempts, single use; rows deleted after 24 h. A right code for a new number stores the registration token's hash here (migration 0003) |
 | `refresh_tokens` | `id`, `device_id FK`, `family_id`, `token_hash UNIQUE`, `parent_id`, `expires_at`, `used_at`, `revoked_at`, `created_at` | `family_id` = the chain; reuse ⇒ revoke the family |
 | `sms_daily_usage` ✅ | `day date PK` (UTC), `sent int` (check `>= 0`) | Global daily SMS cap. Kept in Postgres, **not** Redis, so a Redis restart can't reset the money guard |
 
 Per-phone and per-IP rate limits live in Redis db 1 (losing them on a restart is acceptable).
-`otp_challenges` rows older than 24 h are deleted by an hourly loop in every pod (`services/otp.cleanup_loop`,
-started in `main.lifespan`; harmless to run twice). Refresh-token cleanup comes with step 6.
+An hourly loop in every pod (`services/cleanup.cleanup_loop`, started in `main.lifespan`; harmless to run
+twice) deletes `otp_challenges` rows older than 24 h and devices revoked more than 30 days ago. Refresh-token cleanup comes with step 6.
 Later: `device_links` for linking secondary devices by QR code (PLAN.md, "Later").
 
 **Migration rules**
@@ -310,6 +364,7 @@ Later: `device_links` for linking secondary devices by QR code (PLAN.md, "Later"
 - OTP codes: 6 digits from `secrets`, stored as `HMAC-SHA256(OTP_PEPPER, "phone:code")`. They are compared in
   constant time (`hmac.compare_digest`), expire after 5 minutes, are invalidated after 5 wrong tries,
   and work once.
+- Registration tokens: only the SHA-256 hash is stored, valid 10 min, single use.
 - Refresh tokens: only the SHA-256 hash is stored, so a database leak doesn't hand out usable tokens.
 - `otp/request` answers the same way for registered and unknown numbers (no account enumeration), with a
   60 s resend cooldown.
@@ -333,7 +388,8 @@ Later: `device_links` for linking secondary devices by QR code (PLAN.md, "Later"
 | `OTP_TTL_SECONDS` / `OTP_RESEND_COOLDOWN_SECONDS` | `300` / `60` | Code lifetime / resend cooldown |
 | `OTP_PHONE_MAX_PER_HOUR` / `_PER_DAY` | `5` / `10` | Codes per phone |
 | `OTP_IP_MAX_PER_HOUR` / `_PER_DAY` | `30` / `200` | Codes per client IP (generous: carrier-grade NAT) |
-| `OTP_RETENTION_HOURS` / `OTP_CLEANUP_INTERVAL_SECONDS` | `24` / `3600` | Cleanup job |
+| `OTP_RETENTION_HOURS` / `OTP_CLEANUP_INTERVAL_SECONDS` | `24` / `3600` | Cleanup job: OTP rows kept / how often it runs |
+| `DEVICE_RETENTION_DAYS` | `30` | Cleanup job: revoked devices kept |
 | `SMS_PROVIDER` | `fake` | `fake` (sends nothing) or `globalsms` |
 | `FAKE_SMS_DAILY_CAP` | `100` | Daily SMS cap while the fake provider is active |
 | `GLOBALSMS_API_KEY` | – | Global SMS key. In the cluster: sealed Secret `auth-sms` |
@@ -413,11 +469,14 @@ Each step is small, tested and deployed before the next.
    locally and in CI). Verified in prod 2026-10-26: code SMS received, spoofed `X-Forwarded-For` ignored.
 5. ✅ Signing keys + access tokens + `jwks.json` (built before step 4, so verify returns real tokens).
 4. 🔨 `POST /auth/otp/verify` + `POST /auth/register` (Telegram-like: a new phone gets a registration token
-   and must send a display name before a user exists).
+   and must send a display name before a user exists) + WhatsApp device model (one primary phone per user,
+   a new SMS login replaces it; `devices.role`, migrations 0003 + 0004).
 6. Refresh tokens: issue, rotate, reuse detection, logout, devices list/remove.
 7. Tracing (OpenTelemetry → Tempo) + metrics.
 8. Dummy Expo app against it (PLAN.md phase 8).
 9. ✅ Real SMS provider: done as part of step 3 (Global SMS, per-provider settings in `config.py`).
+10. Linking devices by QR (after step 6): `device_links`, `POST /auth/link/start` + `/link/approve`, up to 4
+    `linked` devices; then decide whether a new primary login also signs out linked devices.
 
 ## 14. Deployment
 - Push to `main` → GitHub Actions (ARM runner): checks → image

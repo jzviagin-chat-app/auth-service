@@ -21,7 +21,8 @@ from auth_service.config import get_settings
 from auth_service.core.logging import JsonFormatter
 from auth_service.db.models import OtpChallenge, SmsDailyUsage
 from auth_service.main import create_app
-from auth_service.services.otp import delete_old_challenges, hash_code
+from auth_service.services.cleanup import delete_old_challenges
+from auth_service.services.otp import hash_code
 from auth_service.services.sms import GlobalSmsSender, SmsSendError
 from tests.conftest import TEST_DATABASE_URL, TEST_REDIS_URL, alembic, needs_db, needs_redis
 
