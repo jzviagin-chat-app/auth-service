@@ -5,7 +5,6 @@ This module never reads `users`: a registered and an unknown number get exactly 
 so the answer (and its timing) can't reveal who has an account.
 """
 
-import asyncio
 import hashlib
 import hmac
 import ipaddress
@@ -13,7 +12,7 @@ import logging
 import re
 import secrets
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,7 +20,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from auth_service.config import Settings
 from auth_service.core.masking import mask_phone
 from auth_service.db import repos
-from auth_service.db.engine import Database
 from auth_service.services.rate_limit import (
     Limits,
     LimitsUnavailable,
@@ -168,30 +166,3 @@ async def request_code(
         )
         raise SmsUnavailable("send_failed") from e
     log.info("sms sent", extra={"phone": masked, "provider": sms.name, "message_id": message_id})
-
-
-# ---- cleanup job ----
-
-
-async def delete_old_challenges(db: Database, retention: timedelta) -> int:
-    async with db.session() as session:
-        cutoff = datetime.now(UTC) - retention
-        deleted = await repos.delete_otp_challenges_created_before(session, cutoff)
-        await session.commit()
-    return deleted
-
-
-async def cleanup_loop(db: Database, retention: timedelta, interval_seconds: int) -> None:
-    """Runs for the life of the process (started in main.lifespan), like a setInterval in Node.
-
-    Every pod runs it; that's harmless, because deleting already-deleted rows does nothing.
-    """
-    while True:
-        try:
-            deleted = await delete_old_challenges(db, retention)
-            if deleted:
-                log.info("otp cleanup", extra={"deleted": deleted})
-        except Exception:
-            # Keep the loop alive (e.g. Postgres restarting); try again next round.
-            log.exception("otp cleanup failed")
-        await asyncio.sleep(interval_seconds)

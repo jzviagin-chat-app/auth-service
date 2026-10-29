@@ -5,7 +5,6 @@ import contextlib
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import timedelta
 
 from fastapi import FastAPI
 from redis.asyncio import Redis
@@ -17,8 +16,8 @@ from auth_service.api.router import api_router
 from auth_service.config import get_settings
 from auth_service.core.logging import setup_logging
 from auth_service.db.engine import Database
+from auth_service.services.cleanup import Retention, cleanup_loop
 from auth_service.services.keys import make_signing_keys
-from auth_service.services.otp import cleanup_loop
 from auth_service.services.sms import make_sms_sender
 
 log = logging.getLogger(__name__)
@@ -39,13 +38,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.db = Database(
             settings.database_url, settings.db_pool_size, settings.db_max_overflow
         )
-        cleanup = asyncio.create_task(
-            cleanup_loop(
-                app.state.db,
-                timedelta(hours=settings.otp_retention_hours),
-                settings.otp_cleanup_interval_seconds,
-            )
-        )
+        cleanup = asyncio.create_task(cleanup_loop(app.state.db, Retention.from_settings(settings)))
     else:
         log.warning("DATABASE_URL not set: database features are disabled")
 

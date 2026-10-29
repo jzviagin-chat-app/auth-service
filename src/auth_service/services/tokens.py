@@ -97,3 +97,21 @@ def verify_access_token(
         raise InvalidToken("expired") from None
     except jwt.InvalidTokenError, ValueError, TypeError:
         raise InvalidToken("invalid") from None
+
+
+@dataclass(frozen=True)
+class TokenIssuer:
+    """Everything issuing an access token needs, bundled (built from settings per request)."""
+
+    keys: SigningKeys
+    issuer: str
+    ttl_seconds: int
+
+    def issue(self, *, user_id: uuid.UUID, device_id: uuid.UUID) -> tuple[str, int]:
+        return issue_access_token(
+            self.keys,
+            user_id=user_id,
+            device_id=device_id,
+            issuer=self.issuer,
+            ttl_seconds=self.ttl_seconds,
+        )

@@ -2,8 +2,8 @@
 
 from fastapi import APIRouter
 
-from auth_service.api import devices, jwks, otp, tokens
+from auth_service.api import devices, jwks, otp, register, tokens
 
 api_router = APIRouter(prefix="/auth")
-for module in (otp, tokens, devices, jwks):
+for module in (otp, register, tokens, devices, jwks):
     api_router.include_router(module.router)
