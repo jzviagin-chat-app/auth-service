@@ -1,6 +1,5 @@
 """Request/response bodies shared by several routes."""
 
-import uuid
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -20,20 +19,20 @@ class DeviceIn(BaseModel):
 
 
 class LoggedInOut(BaseModel):
-    """Refresh tokens come in build step 6 (this gains `refresh_token` then)."""
+    """Answer of otp/verify (known number), register and token/refresh."""
 
     status: Literal["logged_in"] = "logged_in"
     access_token: str
     token_type: Literal["Bearer"] = "Bearer"  # noqa: S105 (the scheme name, not a secret)
     expires_in: int  # seconds
-    user_id: uuid.UUID
-    device_id: uuid.UUID
+    # Only for POST /auth/token/refresh, never sent anywhere else. Replace the stored one with it.
+    refresh_token: str
+    # No user_id / device_id: they are in the access token (sub, did).
 
     @classmethod
     def from_result(cls, r: LoggedIn) -> LoggedInOut:
         return cls(
             access_token=r.access_token,
             expires_in=r.expires_in,
-            user_id=r.user_id,
-            device_id=r.device_id,
+            refresh_token=r.refresh_token,
         )

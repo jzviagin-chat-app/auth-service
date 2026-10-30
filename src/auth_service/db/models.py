@@ -126,6 +126,28 @@ class OtpChallenge(Base):
     registration_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class RefreshToken(Base):
+    """One refresh token of a device (README.md, "Sessions"). Only its SHA-256 hash is stored.
+
+    A device's tokens form one line, ordered by `id` (UUIDv7, so by creation time): every login is
+    a new device, so the device is the chain. `used_at` = first sent to /auth/token/refresh;
+    `discarded_at` = thrown away because the app went on with another token. Replaced tokens are
+    kept for a while so a copy used later is recognised as theft; the cleanup job deletes them.
+    """
+
+    __tablename__ = "refresh_tokens"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid7)
+    device_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("devices.id", ondelete="CASCADE"), index=True
+    )
+    token_hash: Mapped[bytes] = mapped_column(LargeBinary(32), unique=True)  # SHA-256
+    created_at: Mapped[datetime] = _now()
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    discarded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class SmsDailyUsage(Base):
     """How many SMS were sent on each UTC day: the global daily cap, a money guard.
 

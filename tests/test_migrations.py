@@ -32,7 +32,9 @@ async def session(migrated: None) -> AsyncIterator[AsyncSession]:
         yield s
         await s.rollback()
     async with engine.begin() as conn:  # leave the tables empty for the next test
-        await conn.execute(text("TRUNCATE users, devices, otp_challenges, sms_daily_usage CASCADE"))
+        await conn.execute(
+            text("TRUNCATE users, devices, refresh_tokens, otp_challenges, sms_daily_usage CASCADE")
+        )
     await engine.dispose()
 
 

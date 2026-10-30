@@ -7,59 +7,29 @@ POST /auth/otp/request too (that one also needs Redis).
 import asyncio
 import logging
 import re
-from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select, text, update
+from sqlalchemy import select, update
 
-from auth_service.config import get_settings
 from auth_service.core.logging import JsonFormatter
 from auth_service.db import repos
 from auth_service.db.models import Device, OtpChallenge, User
-from auth_service.main import create_app
 from auth_service.services import devices
 from auth_service.services.cleanup import delete_old_devices
-from auth_service.services.keys import SigningKeys
 from auth_service.services.otp import hash_code
 from auth_service.services.tokens import verify_access_token
-from tests.conftest import TEST_DATABASE_URL, TEST_REDIS_URL, alembic, needs_db, needs_redis
+from tests.conftest import PEPPER, needs_db, needs_redis
 
 pytestmark = needs_db
 
-PEPPER = "test-pepper"
 PHONE = "+972501234567"
 CODE = "123456"
 DEVICE = {"platform": "ios", "name": "test phone"}
 WEB = {"platform": "web", "name": "browser"}
-
-
-@pytest.fixture(scope="module")
-def migrated() -> None:
-    alembic("upgrade", "head")
-
-
-@pytest.fixture
-async def app(migrated: None, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[FastAPI]:
-    env = {"ENVIRONMENT": "prod", "DATABASE_URL": TEST_DATABASE_URL or "", "OTP_PEPPER": PEPPER}
-    if TEST_REDIS_URL:
-        env["REDIS_URL"] = TEST_REDIS_URL
-    for name, value in env.items():
-        monkeypatch.setenv(name, value)
-    get_settings.cache_clear()
-    app = create_app()
-    async with app.router.lifespan_context(app):
-        async with app.state.db.engine.begin() as conn:
-            await conn.execute(text("TRUNCATE users, devices, otp_challenges, sms_daily_usage"))
-        if app.state.redis is not None:
-            await app.state.redis.flushdb()
-        app.state.keys = SigningKeys(Ed25519PrivateKey.generate())
-        yield app
-    get_settings.cache_clear()
 
 
 def http(app: FastAPI) -> AsyncClient:
@@ -114,14 +84,20 @@ async def the_challenge(app: FastAPI) -> OtpChallenge:
     return c
 
 
+def ids(app: FastAPI, body: dict[str, Any]) -> tuple[str, str]:
+    """(user_id, device_id) of a logged-in reply, read from its access token (sub, did)."""
+    claims = verify_access_token(app.state.keys, body["access_token"], issuer="auth-service")
+    return str(claims.user_id), str(claims.device_id)
+
+
 def check_token(app: FastAPI, body: dict[str, Any]) -> None:
-    """The access token is valid and names the user and device from the response."""
+    """The reply has a valid access token and a refresh token, and no separate ids."""
     assert body["status"] == "logged_in"
     assert body["token_type"] == "Bearer"  # noqa: S105 (the scheme name)
     assert body["expires_in"] == 900
-    claims = verify_access_token(app.state.keys, body["access_token"], issuer="auth-service")
-    assert str(claims.user_id) == body["user_id"]
-    assert str(claims.device_id) == body["device_id"]
+    assert len(body["refresh_token"]) >= 43  # 256 random bits
+    ids(app, body)  # raises if the token doesn't verify
+    assert "user_id" not in body and "device_id" not in body
 
 
 # ---- new phone: verify -> register ----
@@ -142,7 +118,7 @@ async def test_new_phone_registers(app: FastAPI) -> None:
     [device] = await rows(app, Device)
     assert (user.phone_e164, user.display_name) == (PHONE, "Jacob")  # trimmed
     assert (device.user_id, device.platform, device.name) == (user.id, "ios", "test phone")
-    assert str(device.id) == body["device_id"]
+    assert str(device.id) == ids(app, body)[1]
 
 
 async def test_registration_token_works_once(app: FastAPI) -> None:
@@ -208,9 +184,9 @@ async def test_known_phone_logs_in_with_a_new_device(app: FastAPI) -> None:
     status, body = await verify(app)
     assert status == 200
     check_token(app, body)
-    assert body["user_id"] == str(user.id)
+    assert ids(app, body)[0] == str(user.id)
     [device] = await rows(app, Device)
-    assert str(device.id) == body["device_id"]
+    assert str(device.id) == ids(app, body)[1]
     assert (device.role, device.revoked_at) == ("primary", None)
     assert device.last_seen_at is not None
 
@@ -228,12 +204,12 @@ async def test_new_sms_login_replaces_the_primary(app: FastAPI) -> None:
     await add_code(app, "654321")
     status, second = await verify(app, "654321", device={"platform": "android"})
     assert status == 200
-    assert second["user_id"] == first["user_id"]
-    assert second["device_id"] != first["device_id"]
+    assert ids(app, second)[0] == ids(app, first)[0]
+    assert ids(app, second)[1] != ids(app, first)[1]
 
     by_id = {str(d.id): d for d in await rows(app, Device)}
-    assert by_id[first["device_id"]].revoked_at is not None
-    assert [str(d.id) for d in await active_primaries(app)] == [second["device_id"]]
+    assert by_id[ids(app, first)[1]].revoked_at is not None
+    assert [str(d.id) for d in await active_primaries(app)] == [ids(app, second)[1]]
 
 
 async def test_web_cannot_log_in_by_sms(app: FastAPI) -> None:
@@ -290,8 +266,8 @@ async def test_race_lost_once_is_retried(app: FastAPI, monkeypatch: pytest.Monke
     await add_code(app)
     status, body = await verify(app)
     assert status == 200 and calls == 2
-    assert body["user_id"] == str(user.id)
-    assert [str(d.id) for d in await active_primaries(app)] == [body["device_id"]]
+    assert ids(app, body)[0] == str(user.id)
+    assert [str(d.id) for d in await active_primaries(app)] == [ids(app, body)[1]]
 
 
 async def test_race_lost_twice_answers_409(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None:

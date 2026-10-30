@@ -4,7 +4,8 @@ WhatsApp model (PLAN.md section 6): a user has one **primary** device, a phone l
 A new SMS login replaces it: the old primary is revoked in the same transaction. Whoever gets hold
 of a code (SIM swap, phishing) therefore signs the real owner out, so a takeover is noticed instead
 of an extra device silently reading along. Linked devices (QR) come in step 10; listing and signing
-out devices in step 6.
+out devices in step 6b. Signing a device out (`revoked_at`) also kills its refresh tokens
+(services/refresh.py checks the device first).
 """
 
 import logging
@@ -36,6 +37,11 @@ class LoggedIn:
     device_id: uuid.UUID
     access_token: str
     expires_in: int
+    refresh_token: str
+
+
+class AccountBlocked(Exception):
+    """The user's status is "blocked": no login, no refresh."""
 
 
 class UnsupportedPlatform(Exception):
@@ -80,7 +86,6 @@ async def replace_primary(
     for _ in range(2):
         try:
             async with session.begin_nested():
-                # Step 6: also revoke the old device's refresh tokens here.
                 old_id = await repos.revoke_active_primary(session, user_id, now)
                 new_id = await add_primary(session, user_id, device, now)
                 return new_id, old_id

@@ -19,6 +19,7 @@ from auth_service.config import get_settings
 from auth_service.db.engine import Database
 from auth_service.services.keys import SigningKeys
 from auth_service.services.otp import OtpPolicy
+from auth_service.services.refresh import RefreshPolicy
 from auth_service.services.sms import SmsSender
 from auth_service.services.tokens import TokenIssuer
 
@@ -63,23 +64,50 @@ def get_otp_context(request: Request) -> OtpContext:
 OtpContextDep = Annotated[OtpContext, Depends(get_otp_context)]
 
 
+def _tokens_unavailable() -> ApiError:
+    return ApiError(503, "tokens_unavailable", "Can't log in right now; try again later")
+
+
 @dataclass(frozen=True)
-class LoginContext:
-    """What checking a code and issuing tokens needs besides the database."""
+class SessionContext:
+    """What issuing access and refresh tokens needs besides the database (token/refresh)."""
 
     tokens: TokenIssuer
+    refresh: RefreshPolicy
+
+
+def get_session_context(request: Request) -> SessionContext:
+    """503 before anything is read or changed when there is no signing key (JWT_PRIVATE_KEY)."""
+    keys: SigningKeys | None = getattr(request.app.state, "keys", None)
+    if keys is None:
+        raise _tokens_unavailable()
+    settings = get_settings()
+    return SessionContext(
+        tokens=TokenIssuer(keys, settings.jwt_issuer, settings.access_token_ttl_seconds),
+        refresh=RefreshPolicy.from_settings(settings),
+    )
+
+
+SessionContextDep = Annotated[SessionContext, Depends(get_session_context)]
+
+
+@dataclass(frozen=True)
+class LoginContext:
+    """What checking a code and logging in needs besides the database."""
+
+    tokens: TokenIssuer
+    refresh: RefreshPolicy
     pepper: bytes
 
 
-def get_login_context(request: Request) -> LoginContext:
-    """503 before anything is read or changed (no code is used up) when we couldn't finish a
-    login: no signing key (JWT_PRIVATE_KEY) or no OTP_PEPPER to check codes with."""
-    keys: SigningKeys | None = getattr(request.app.state, "keys", None)
+def get_login_context(ctx: SessionContextDep) -> LoginContext:
+    """Also 503 (no code is used up) without the OTP_PEPPER to check codes with."""
     settings = get_settings()
-    if keys is None or settings.otp_pepper is None:
-        raise ApiError(503, "tokens_unavailable", "Can't log in right now; try again later")
+    if settings.otp_pepper is None:
+        raise _tokens_unavailable()
     return LoginContext(
-        tokens=TokenIssuer(keys, settings.jwt_issuer, settings.access_token_ttl_seconds),
+        tokens=ctx.tokens,
+        refresh=ctx.refresh,
         pepper=settings.otp_pepper.get_secret_value().encode(),
     )
 

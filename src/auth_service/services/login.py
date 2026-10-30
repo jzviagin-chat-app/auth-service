@@ -2,7 +2,8 @@
 
     otp/verify {phone, code, device}
       wrong code             -> InvalidCode (attempt counted)
-      right code, known user -> LoggedIn (this phone replaces the primary device + access token)
+      right code, known user -> LoggedIn (this phone replaces the primary device + access and
+                                refresh tokens)
       right code, new phone  -> RegistrationRequired (services/registration.py takes over)
 
 Devices (the primary-device rule) are in services/devices.py. No HTTP here (api/ maps the
@@ -17,8 +18,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth_service.core.masking import mask_phone
 from auth_service.db import repos
-from auth_service.services.devices import DeviceInfo, LoggedIn, check_sms_platform, replace_primary
+from auth_service.services.devices import (
+    AccountBlocked,
+    DeviceInfo,
+    LoggedIn,
+    check_sms_platform,
+    replace_primary,
+)
 from auth_service.services.otp import InvalidPhone, hash_code, is_israeli_mobile
+from auth_service.services.refresh import RefreshPolicy, issue_refresh_token
 from auth_service.services.registration import RegistrationRequired, start_registration
 from auth_service.services.tokens import TokenIssuer
 
@@ -39,10 +47,6 @@ class CodeExpired(Exception):
     """No usable code: none sent, expired, already used, or too many wrong tries."""
 
 
-class AccountBlocked(Exception):
-    pass
-
-
 async def verify_code(
     *,
     phone: str,
@@ -51,6 +55,7 @@ async def verify_code(
     session: AsyncSession,
     pepper: bytes,
     tokens: TokenIssuer,
+    refresh: RefreshPolicy,
     now: datetime,
 ) -> LoggedIn | RegistrationRequired:
     if not is_israeli_mobile(phone):
@@ -97,6 +102,7 @@ async def verify_code(
 
     user_id = user.id
     new_device_id, old_device_id = await replace_primary(session, user_id, device, now)
+    refresh_token = await issue_refresh_token(session, new_device_id, refresh, now)
     await session.commit()
     access_token, expires_in = tokens.issue(user_id=user_id, device_id=new_device_id)
     log.info(
@@ -108,4 +114,4 @@ async def verify_code(
             "phone": masked,
         },
     )
-    return LoggedIn(user_id, new_device_id, access_token, expires_in)
+    return LoggedIn(user_id, new_device_id, access_token, expires_in, refresh_token)
