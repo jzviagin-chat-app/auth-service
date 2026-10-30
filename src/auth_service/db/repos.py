@@ -11,7 +11,7 @@ from sqlalchemy import CursorResult, delete, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from auth_service.db.models import Device, OtpChallenge, SmsDailyUsage, User
+from auth_service.db.models import Device, OtpChallenge, RefreshToken, SmsDailyUsage, User
 
 # ---- sms_daily_usage ----
 
@@ -143,5 +143,70 @@ async def delete_devices_revoked_before(session: AsyncSession, cutoff: datetime)
     result = cast(
         CursorResult[Any],
         await session.execute(delete(Device).where(Device.revoked_at < cutoff)),
+    )
+    return result.rowcount
+
+
+async def lock_device(session: AsyncSession, device_id: uuid.UUID) -> tuple[Device, str] | None:
+    """The device and its user's status, the device row locked until the caller commits.
+
+    Every refresh of one device takes this lock first, so they run one at a time (on any pod), and
+    a new SMS login revoking the device waits for it too.
+    """
+    result = await session.execute(
+        select(Device, User.status)
+        .join(User, User.id == Device.user_id)
+        .where(Device.id == device_id)
+        .with_for_update(of=Device)
+    )
+    row = result.first()
+    return None if row is None else (row[0], row[1])
+
+
+# ---- refresh_tokens ----
+
+
+async def insert_refresh_token(
+    session: AsyncSession, *, device_id: uuid.UUID, token_hash: bytes, expires_at: datetime
+) -> RefreshToken:
+    token = RefreshToken(device_id=device_id, token_hash=token_hash, expires_at=expires_at)
+    session.add(token)
+    await session.flush()
+    return token
+
+
+async def refresh_token_by_hash(session: AsyncSession, token_hash: bytes) -> RefreshToken | None:
+    """Always read fresh from the database (populate_existing), also when the session already
+    holds the row: called again after waiting for the device lock, when it may have changed."""
+    result = await session.scalars(
+        select(RefreshToken)
+        .where(RefreshToken.token_hash == token_hash)
+        .execution_options(populate_existing=True)
+    )
+    return result.first()
+
+
+async def live_refresh_tokens(session: AsyncSession, device_id: uuid.UUID) -> list[RefreshToken]:
+    """The device's tokens that aren't discarded (the current one and the waiting ones), oldest
+    first. Call with the device locked."""
+    result = await session.scalars(
+        select(RefreshToken)
+        .where(RefreshToken.device_id == device_id, RefreshToken.discarded_at.is_(None))
+        .order_by(RefreshToken.id)
+    )
+    return list(result.all())
+
+
+async def delete_old_refresh_tokens(
+    session: AsyncSession, *, now: datetime, discarded_before: datetime
+) -> int:
+    """Expired tokens, and tokens discarded before the cutoff."""
+    result = cast(
+        CursorResult[Any],
+        await session.execute(
+            delete(RefreshToken).where(
+                (RefreshToken.expires_at < now) | (RefreshToken.discarded_at < discarded_before)
+            )
+        ),
     )
     return result.rowcount

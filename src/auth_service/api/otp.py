@@ -110,6 +110,7 @@ async def verify_otp(
             session=db,
             pepper=ctx.pepper,
             tokens=ctx.tokens,
+            refresh=ctx.refresh,
             now=datetime.now(UTC),
         )
     except otp.InvalidPhone as e:
@@ -126,7 +127,7 @@ async def verify_otp(
         raise ApiError(
             400, "code_expired", "This code can't be used anymore; request a new one"
         ) from e
-    except login.AccountBlocked as e:
+    except devices.AccountBlocked as e:
         raise ApiError(403, "account_blocked", "This account is blocked") from e
     except devices.LoginConflict as e:
         raise ApiError(

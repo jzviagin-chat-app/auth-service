@@ -5,7 +5,7 @@ Contract (ARCHITECTURE.md §5.1): signed with EdDSA (Ed25519), valid 15 minutes,
 A JWT is readable by anyone (base64, not encrypted): never put secrets in it. The signature only
 proves auth-service issued it and nothing was changed.
 
-Refresh tokens (long-lived, stored as hashes) come in build step 6.
+Refresh tokens (long-lived, opaque, stored as hashes) are in services/refresh.py.
 """
 
 import uuid

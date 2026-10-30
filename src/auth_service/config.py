@@ -89,6 +89,17 @@ class Settings(BaseSettings):
     jwt_issuer: str = "auth-service"  # the "iss" claim; consumers check it
     access_token_ttl_seconds: PositiveInt = 900  # 15 minutes
 
+    # ---- refresh tokens (opaque, SHA-256 stored, one line per device) ----
+    refresh_token_ttl_days: PositiveInt = (
+        60  # from the last refresh: an active user stays logged in
+    )
+    # Tokens issued for retries (lost replies) that may wait unused at the same time; beyond that
+    # the oldest is discarded.
+    refresh_max_pending: PositiveInt = 5
+    # Replaced tokens are kept this long, so a copy used later still signs the device out (theft);
+    # after that it is deleted and just gets 401.
+    refresh_replaced_retention_days: PositiveInt = 7
+
     # Which SMS provider sends the codes. Each one has its own settings block (above).
     sms_provider: Literal["fake", "globalsms"] = "fake"
     fake_sms: FakeSmsSettings = Field(default_factory=FakeSmsSettings)

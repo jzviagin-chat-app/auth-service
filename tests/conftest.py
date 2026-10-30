@@ -6,11 +6,15 @@ import sys
 from collections.abc import AsyncIterator, Iterator
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from dotenv import load_dotenv
+from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import text
 
 from auth_service.config import get_settings
 from auth_service.main import create_app
+from auth_service.services.keys import SigningKeys
 
 load_dotenv()  # local .env may set TEST_DATABASE_URL (real environment variables win)
 
@@ -55,3 +59,35 @@ async def client(prod_settings: None) -> AsyncIterator[AsyncClient]:
     app = create_app()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         yield c
+
+
+# ---- the app against the test database (login, register, refresh tests) ----
+# A test module that defines its own `app` / `migrated` fixture uses that one instead.
+
+PEPPER = "test-pepper"
+
+
+@pytest.fixture(scope="module")
+def migrated() -> None:
+    alembic("upgrade", "head")
+
+
+@pytest.fixture
+async def app(migrated: None, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[FastAPI]:
+    env = {"ENVIRONMENT": "prod", "DATABASE_URL": TEST_DATABASE_URL or "", "OTP_PEPPER": PEPPER}
+    if TEST_REDIS_URL:
+        env["REDIS_URL"] = TEST_REDIS_URL
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    get_settings.cache_clear()
+    app = create_app()
+    async with app.router.lifespan_context(app):
+        async with app.state.db.engine.begin() as conn:
+            await conn.execute(
+                text("TRUNCATE users, devices, refresh_tokens, otp_challenges, sms_daily_usage")
+            )
+        if app.state.redis is not None:
+            await app.state.redis.flushdb()
+        app.state.keys = SigningKeys(Ed25519PrivateKey.generate())
+        yield app
+    get_settings.cache_clear()

@@ -44,6 +44,7 @@ async def register(body: RegisterIn, db: DbSession, ctx: LoginContextDep) -> Log
             device=body.device.to_info(),
             session=db,
             tokens=ctx.tokens,
+            refresh=ctx.refresh,
             now=datetime.now(UTC),
         )
     except devices.UnsupportedPlatform as e:
