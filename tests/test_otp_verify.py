@@ -237,7 +237,7 @@ async def test_parallel_logins_leave_one_primary(app: FastAPI) -> None:
 
     async def one_login() -> None:
         async with app.state.db.session() as s:
-            await devices.replace_primary(s, user.id, phone, datetime.now(UTC))
+            await devices.replace_primary(s, user.id, phone, app.state.revoked, datetime.now(UTC))
             await asyncio.sleep(0.05)  # hold the transaction open, so the two overlap
             await s.commit()
 
@@ -251,23 +251,27 @@ async def test_parallel_logins_leave_one_primary(app: FastAPI) -> None:
 async def test_race_lost_once_is_retried(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None:
     user = await add_user(app)
     await add_code(app, "111111")
-    await verify(app, "111111")  # an active primary exists
-    real_revoke = repos.revoke_active_primary
+    _, first = await verify(app, "111111")  # an active primary exists
+    real_lookup = repos.active_primary_id
     calls = 0
 
-    async def revoke_too_late(*args: Any) -> Any:
+    async def found_too_late(*args: Any) -> Any:
         # The first try "misses" the existing primary, as if a parallel login had just
         # committed it: the INSERT hits the unique index.
         nonlocal calls
         calls += 1
-        return None if calls == 1 else await real_revoke(*args)
+        return None if calls == 1 else await real_lookup(*args)
 
-    monkeypatch.setattr(repos, "revoke_active_primary", revoke_too_late)
+    monkeypatch.setattr(repos, "active_primary_id", found_too_late)
     await add_code(app)
     status, body = await verify(app)
     assert status == 200 and calls == 2
     assert ids(app, body)[0] == str(user.id)
     assert [str(d.id) for d in await active_primaries(app)] == [ids(app, body)[1]]
+    # The replaced phone (revoked on the retry, outside the failed savepoint) is published.
+    await app.state.revoked.drain()
+    old_key = f"revoked:device:{ids(app, first)[1]}"
+    assert await app.state.revoked.redis.exists(old_key)
 
 
 async def test_race_lost_twice_answers_409(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -275,10 +279,10 @@ async def test_race_lost_twice_answers_409(app: FastAPI, monkeypatch: pytest.Mon
     await add_code(app, "111111")
     await verify(app, "111111")
 
-    async def never_revoke(*args: Any) -> None:
+    async def never_found(*args: Any) -> None:
         return None
 
-    monkeypatch.setattr(repos, "revoke_active_primary", never_revoke)
+    monkeypatch.setattr(repos, "active_primary_id", never_found)
     await add_code(app)
     status, body = await verify(app)
     assert (status, body["error"]) == (409, "login_conflict")

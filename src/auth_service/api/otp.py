@@ -111,6 +111,7 @@ async def verify_otp(
             pepper=ctx.pepper,
             tokens=ctx.tokens,
             refresh=ctx.refresh,
+            revoked=ctx.revoked,
             now=datetime.now(UTC),
         )
     except otp.InvalidPhone as e:

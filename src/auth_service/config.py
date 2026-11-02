@@ -100,6 +100,15 @@ class Settings(BaseSettings):
     # after that it is deleted and just gets 401.
     refresh_replaced_retention_days: PositiveInt = 7
 
+    # ---- revoked devices, published for chat-service (services/revocation.py) ----
+    # redis://redis:6379/2 in the cluster: the Redis db shared by the services (auth's own keys stay
+    # in REDIS_URL's db 1). auth only writes there. Unset -> nothing is published (logged at start).
+    shared_redis_url: str | None = None
+    # A revoked device's key lives this long after the revocation: longer than any access token of
+    # it can (15 min + 30 s verify leeway + margin), so chat-service never accepts one by mistake.
+    revoked_key_ttl_seconds: PositiveInt = 1020
+    revoked_sync_interval_seconds: PositiveInt = 60  # how often every pod rewrites recent keys
+
     # Which SMS provider sends the codes. Each one has its own settings block (above).
     sms_provider: Literal["fake", "globalsms"] = "fake"
     fake_sms: FakeSmsSettings = Field(default_factory=FakeSmsSettings)

@@ -5,6 +5,7 @@ import contextlib
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import timedelta
 
 from fastapi import FastAPI
 from redis.asyncio import Redis
@@ -18,6 +19,7 @@ from auth_service.core.logging import setup_logging
 from auth_service.db.engine import Database
 from auth_service.services.cleanup import Retention, cleanup_loop
 from auth_service.services.keys import make_signing_keys
+from auth_service.services.revocation import RevokedDevices, resync_loop
 from auth_service.services.sms import make_sms_sender
 
 log = logging.getLogger(__name__)
@@ -32,13 +34,35 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.db = None
     app.state.redis = None
     app.state.sms = make_sms_sender(settings)
-    cleanup: asyncio.Task[None] | None = None
+    tasks: list[asyncio.Task[None]] = []
+
+    # The Redis db shared with chat-service (revoked devices). auth only writes there.
+    shared_redis = None
+    if settings.shared_redis_url:
+        shared_redis = Redis.from_url(
+            settings.shared_redis_url, socket_timeout=1, socket_connect_timeout=1
+        )
+    else:
+        log.warning("SHARED_REDIS_URL not set: revoked devices are not published for chat-service")
+    app.state.revoked = RevokedDevices(
+        shared_redis, timedelta(seconds=settings.revoked_key_ttl_seconds)
+    )
 
     if settings.database_url:
         app.state.db = Database(
             settings.database_url, settings.db_pool_size, settings.db_max_overflow
         )
-        cleanup = asyncio.create_task(cleanup_loop(app.state.db, Retention.from_settings(settings)))
+        tasks.append(
+            asyncio.create_task(cleanup_loop(app.state.db, Retention.from_settings(settings)))
+        )
+        if shared_redis is not None:
+            tasks.append(
+                asyncio.create_task(
+                    resync_loop(
+                        app.state.db, app.state.revoked, settings.revoked_sync_interval_seconds
+                    )
+                )
+            )
     else:
         log.warning("DATABASE_URL not set: database features are disabled")
 
@@ -56,14 +80,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     log.info("started", extra={"environment": settings.environment})
     yield
 
-    if cleanup is not None:
-        cleanup.cancel()
+    for task in tasks:
+        task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await cleanup
+            await task
     if app.state.sms is not None:
         await app.state.sms.aclose()  # e.g. the provider's HTTP connection pool
     if app.state.redis is not None:
         await app.state.redis.aclose()
+    await app.state.revoked.drain()  # revoked devices still being written to Redis
+    if shared_redis is not None:
+        await shared_redis.aclose()
     if app.state.db is not None:
         await app.state.db.dispose()
     log.info("stopped")

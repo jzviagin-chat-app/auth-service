@@ -28,6 +28,7 @@ from auth_service.services.devices import (
 from auth_service.services.otp import InvalidPhone, hash_code, is_israeli_mobile
 from auth_service.services.refresh import RefreshPolicy, issue_refresh_token
 from auth_service.services.registration import RegistrationRequired, start_registration
+from auth_service.services.revocation import RevokedDevices
 from auth_service.services.tokens import TokenIssuer
 
 log = logging.getLogger(__name__)
@@ -56,6 +57,7 @@ async def verify_code(
     pepper: bytes,
     tokens: TokenIssuer,
     refresh: RefreshPolicy,
+    revoked: RevokedDevices,
     now: datetime,
 ) -> LoggedIn | RegistrationRequired:
     if not is_israeli_mobile(phone):
@@ -101,7 +103,8 @@ async def verify_code(
         raise AccountBlocked
 
     user_id = user.id
-    new_device_id, old_device_id = await replace_primary(session, user_id, device, now)
+    # The old phone is signed out in the same transaction (published for chat-service on commit).
+    new_device_id = await replace_primary(session, user_id, device, revoked, now)
     refresh_token = await issue_refresh_token(session, new_device_id, refresh, now)
     await session.commit()
     access_token, expires_in = tokens.issue(user_id=user_id, device_id=new_device_id)
@@ -110,7 +113,6 @@ async def verify_code(
         extra={
             "user_id": str(user_id),
             "device_id": str(new_device_id),
-            "replaced_device_id": str(old_device_id) if old_device_id else None,
             "phone": masked,
         },
     )

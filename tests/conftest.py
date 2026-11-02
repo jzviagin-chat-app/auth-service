@@ -76,7 +76,9 @@ def migrated() -> None:
 async def app(migrated: None, monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[FastAPI]:
     env = {"ENVIRONMENT": "prod", "DATABASE_URL": TEST_DATABASE_URL or "", "OTP_PEPPER": PEPPER}
     if TEST_REDIS_URL:
+        # auth's own db and the shared one are the same test db here (flushed below).
         env["REDIS_URL"] = TEST_REDIS_URL
+        env["SHARED_REDIS_URL"] = TEST_REDIS_URL
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     get_settings.cache_clear()
