@@ -30,6 +30,7 @@ from auth_service.config import Settings
 from auth_service.core.hashing import hash_secret, new_secret_token
 from auth_service.db import repos
 from auth_service.services.devices import AccountBlocked, LoggedIn
+from auth_service.services.revocation import RevokedDevices, revoke_device
 from auth_service.services.tokens import TokenIssuer
 
 log = logging.getLogger(__name__)
@@ -70,6 +71,7 @@ async def refresh(
     session: AsyncSession,
     tokens: TokenIssuer,
     policy: RefreshPolicy,
+    revoked: RevokedDevices,
     now: datetime,
 ) -> LoggedIn:
     token_hash = hash_secret(refresh_token)
@@ -94,7 +96,7 @@ async def refresh(
     if found.discarded_at is not None:
         # Someone used a replaced token: either a copy, or the real app holds the copy and the
         # thief went first. We can't tell which, so the device is signed out (both log in again).
-        device.revoked_at = now
+        await revoke_device(session, revoked, device_id, now, "refresh_token_reused")
         await session.commit()
         log.warning("refresh token reused: device signed out", extra=log_ids)
         raise InvalidRefreshToken("reused")

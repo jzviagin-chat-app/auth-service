@@ -126,17 +126,64 @@ async def insert_device(
     return device
 
 
-async def revoke_active_primary(
-    session: AsyncSession, user_id: uuid.UUID, now: datetime
-) -> uuid.UUID | None:
-    """Sign out the user's current primary device; returns its id (None if there was none)."""
+async def active_primary_id(session: AsyncSession, user_id: uuid.UUID) -> uuid.UUID | None:
+    """The id of the user's primary device that isn't signed out (None if there is none)."""
+    result = await session.scalars(
+        select(Device.id).where(
+            Device.user_id == user_id, Device.role == "primary", Device.revoked_at.is_(None)
+        )
+    )
+    return result.first()
+
+
+async def device_with_status(
+    session: AsyncSession, device_id: uuid.UUID
+) -> tuple[Device, str] | None:
+    """The device and its user's status (no lock)."""
+    result = await session.execute(
+        select(Device, User.status)
+        .join(User, User.id == Device.user_id)
+        .where(Device.id == device_id)
+    )
+    row = result.first()
+    return None if row is None else (row[0], row[1])
+
+
+async def get_device(session: AsyncSession, device_id: uuid.UUID) -> Device | None:
+    return await session.get(Device, device_id)
+
+
+async def active_devices(session: AsyncSession, user_id: uuid.UUID) -> list[Device]:
+    """The user's devices that aren't signed out, oldest first."""
+    result = await session.scalars(
+        select(Device)
+        .where(Device.user_id == user_id, Device.revoked_at.is_(None))
+        .order_by(Device.created_at)
+    )
+    return list(result.all())
+
+
+async def revoke_device(session: AsyncSession, device_id: uuid.UUID, now: datetime) -> bool:
+    """Sign the device out; False if it already was (or doesn't exist). The only SQL that sets
+    `revoked_at`: call it through services/revocation.revoke_device. Waits for a refresh of the
+    same device that holds its lock (lock_device)."""
     result = await session.execute(
         update(Device)
-        .where(Device.user_id == user_id, Device.role == "primary", Device.revoked_at.is_(None))
+        .where(Device.id == device_id, Device.revoked_at.is_(None))
         .values(revoked_at=now)
         .returning(Device.id)
     )
-    return result.scalar_one_or_none()
+    return result.scalar_one_or_none() is not None
+
+
+async def devices_revoked_since(
+    session: AsyncSession, cutoff: datetime
+) -> list[tuple[uuid.UUID, datetime]]:
+    """(id, revoked_at) of every device signed out at or after `cutoff`."""
+    result = await session.execute(
+        select(Device.id, Device.revoked_at).where(Device.revoked_at >= cutoff)
+    )
+    return [(device_id, revoked_at) for device_id, revoked_at in result.all() if revoked_at]
 
 
 async def delete_devices_revoked_before(session: AsyncSession, cutoff: datetime) -> int:

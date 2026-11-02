@@ -3,9 +3,9 @@
 Sign-up and login with a phone number and an SMS code. It issues the tokens that every other
 service (chat-service first) uses to know **who** is calling and **from which device**.
 
-> **Status: sign-up and login.** `POST /auth/otp/request` sends real SMS codes (Global SMS),
-> `otp/verify` + `register` log users in with access + refresh tokens, `token/refresh` keeps them logged in.
-> Logout and the devices list come next (see [Build plan](#13-build-plan)).
+> **Status: sign-up, login, sessions.** `POST /auth/otp/request` sends real SMS codes (Global SMS),
+> `otp/verify` + `register` log users in with access + refresh tokens, `token/refresh` keeps them logged in,
+> `logout` and `devices` sign devices out. Tracing comes next (see [Build plan](#13-build-plan)).
 
 ---
 
@@ -105,21 +105,22 @@ auth-service/
 │   │   ├── router.py       #   mounts all feature routers under /auth
 │   │   ├── errors.py       #   the {"error", "message"} shape for every error
 │   │   ├── deps.py         #   dependencies routes receive (DbSession, OtpContextDep, LoginContextDep,
-│   │   │                   #   SessionContextDep)
+│   │   │                   #   SessionContextDep, CurrentDevice, TokenDevice, RevokedDep)
 │   │   ├── otp.py          #   /auth/otp/request ✅, /auth/otp/verify ✅
 │   │   ├── register.py     #   /auth/register ✅
 │   │   ├── schemas.py      #   bodies shared by routes (DeviceIn, LoggedInOut)
-│   │   ├── tokens.py       #   /auth/token/refresh ✅, (later) /auth/logout
-│   │   ├── devices.py      #   (empty) /auth/devices
+│   │   ├── tokens.py       #   /auth/token/refresh ✅, /auth/logout ✅
+│   │   ├── devices.py      #   GET /auth/devices ✅, DELETE /auth/devices/{id} ✅
 │   │   └── jwks.py         #   /auth/.well-known/jwks.json ✅
 │   ├── services/           # business logic
 │   │   ├── otp.py          #   request a code: validation, hashing, the flow
 │   │   ├── login.py        #   otp/verify: check a code → logged in / registration required
 │   │   ├── registration.py #   registration token, register (new user + primary device)
-│   │   ├── devices.py      #   shared by both: device info, phones only, replace the primary device
+│   │   ├── devices.py      #   device info, phones only, replace the primary, logout, list, remove
 │   │   ├── refresh.py      #   refresh tokens: issue at login, rotate, lost replies, reuse detection
 │   │   ├── cleanup.py      #   hourly job: old OTP rows, long-revoked devices, old refresh tokens
 │   │   ├── rate_limit.py   #   per-phone / per-IP limits in Redis
+│   │   ├── revocation.py   #   signing a device out (the one place), publishing it in the shared Redis, resync
 │   │   ├── keys.py         #   Ed25519 signing keys, kid (RFC 7638 thumbprint), JWKS document
 │   │   ├── tokens.py       #   issue / verify access tokens (JWT, EdDSA)
 │   │   └── sms.py          #   SmsSender interface, FakeSmsSender, GlobalSmsSender, make_sms_sender()
@@ -140,6 +141,7 @@ auth-service/
     ├── test_otp_request.py # POST /auth/otp/request against real Postgres + Redis
     ├── test_otp_verify.py  # POST /auth/otp/verify + /auth/register against real Postgres
     ├── test_refresh.py     # POST /auth/token/refresh: rotation, lost replies, reuse, cleanup
+    ├── test_devices.py     # CurrentDevice, logout, devices list/remove, revoked devices in Redis
     ├── test_tokens.py      # signing keys, access tokens, jwks.json
     └── test_migrations.py  # migrations + constraints against real Postgres
 ```
@@ -179,7 +181,9 @@ async def verify_otp(body: VerifyOtpIn, db: DbSession) -> TokensOut: ...
 ```
 
 `DbSession` (in `api/deps.py`) opens one database session per request, and closes or rolls it back
-automatically. Later `CurrentDevice` will decode the access token the same way.
+automatically. `CurrentDevice` gives a route the logged-in caller the same way:
+`async def list_devices(me: CurrentDevice, db: DbSession)` (like an Express auth middleware setting
+`req.user`, but per route and typed).
 
 ## 6. App lifecycle, settings, logging
 
@@ -247,8 +251,28 @@ Later each line also gets `trace_id`, linked to its trace in Tempo.
 - **Rules for the app:** send one refresh at a time; save the new refresh token before using it; ignore
   replies to requests it has given up on. If the reply is lost, retry with the same token. Refresh a minute
   or so before the access token expires.
-- **Logout / remove a device (step 6b):** sign the device out. Its access token still works for up to
-  15 minutes. chat-service can also check a Redis "revoked devices" set when the socket connects.
+- **The logged-in caller (`api/deps.CurrentDevice`):** reads `Authorization: Bearer <access token>`,
+  verifies it (`verify_access_token`), then reads the device in Postgres: a signed-out device gets `401`
+  at once, not only when its token expires; a blocked user `403`. Logout uses `TokenDevice` (the token
+  only), so it also succeeds for a device that is already signed out.
+- **Signing a device out** (`devices.revoked_at`): logout, the primary removing a linked device, a new SMS
+  login replacing the primary, refresh-token reuse. All four go through one function,
+  `services/revocation.revoke_device` (the only caller of `repos.revoke_device`, the only SQL that sets
+  `revoked_at`); it never commits, so a login can revoke the old phone in the same transaction that
+  creates the new one. Its refresh tokens stop at once (refresh reads the device), auth's endpoints
+  refuse its access token at once, and chat-service learns it from Redis:
+- **Revoked devices for chat-service** (`services/revocation.py`, decided 2026-11-02): `revoke_device`
+  remembers the device on the session (`session.info`); a SQLAlchemy `after_commit` listener then starts
+  a background write (the reply doesn't wait; a rolled-back transaction writes nothing) of
+  `revoked:device:<device_id>` into the Redis db shared by the services
+  (`SHARED_REDIS_URL`, db 2), expiring 17 min after the revocation (by then every access token of the
+  device has expired). auth only writes these keys, never reads them. A failed write (3 quick tries,
+  ~1 s in total) doesn't fail the request: every pod rewrites the keys of all devices revoked in the
+  last 17 min each minute, plus a marker `revoked:synced` (expires after 3 min), so a Redis restart is
+  refilled within a minute and a missing marker tells chat-service the list may be incomplete.
+- **Who manages devices (WhatsApp model):** only the primary lists devices and removes linked ones; a
+  linked device can only log itself out; the primary leaves by logout or a new SMS login. What a primary
+  logout or replacement does to linked devices is decided in step 10.
 - **WebSocket (chat-service):** connect, then send `{"type":"auth","token":"<access>"}` within 5 s.
   The token is never put in the URL, because URLs end up in logs.
 - **Signing keys** (`services/keys.py`): an Ed25519 private key (PEM) in `JWT_PRIVATE_KEY` from the sealed
@@ -278,9 +302,9 @@ and mobile apps don't handle cookies well. Why not one long-lived JWT: it can't 
 | POST | `/auth/otp/verify` | – | Check the code → logged in, or registration required ✅ |
 | POST | `/auth/register` | registration token | New number: display name → user + device + token ✅ |
 | POST | `/auth/token/refresh` | refresh token | New access + refresh token ✅ (retry with the same token if the reply is lost) |
-| POST | `/auth/logout` | access token | Sign this device out |
-| GET | `/auth/devices` | access token | List my devices |
-| DELETE | `/auth/devices/{id}` | access token | Sign a device out |
+| POST | `/auth/logout` | access token | Sign this device out ✅ (always `204`) |
+| GET | `/auth/devices` | access token (primary) | List my active devices ✅ |
+| DELETE | `/auth/devices/{id}` | access token (primary) | Sign one of my linked devices out ✅ |
 | GET | `/auth/.well-known/jwks.json` | – | Public keys for verifying access tokens ✅ (`Cache-Control: public, max-age=300`) |
 | GET | `/auth/docs` | – | Interactive API docs, **dev only** |
 
@@ -348,6 +372,28 @@ bounded by 5 tries per code × 10 codes a day per number (the `otp/request` limi
 | `403 account_blocked` | The user's status is `blocked` |
 | `503 tokens_unavailable` | No signing key configured (nothing is changed) |
 
+**Logged-in endpoints** send `Authorization: Bearer <access token>`. Every one may answer
+`401 invalid_token` (missing, invalid, expired, or the device is signed out; with
+`WWW-Authenticate: Bearer`): refresh, or log in again if that fails too. `403 account_blocked`: the user
+is blocked. `503 tokens_unavailable`: no signing key configured.
+
+**`POST /auth/logout`** → `204`, also when the device was already signed out. Delete the stored tokens.
+
+**`GET /auth/devices`**
+
+| Answer | When |
+|---|---|
+| `200 {"devices": [{"id", "platform", "name", "role", "created_at", "last_seen_at", "current"}]}` | The user's active devices, oldest first; `current` is the caller. `last_seen_at` = last login or refresh |
+| `403 action_not_allowed` | The caller is a linked device: only the primary manages devices |
+
+**`DELETE /auth/devices/{id}`**
+
+| Answer | When |
+|---|---|
+| `204` | The linked device is signed out (or already was) |
+| `403 action_not_allowed` | The caller isn't the primary, or `id` is the caller itself (log out instead) |
+| `404 not_found` | No such device of this user (another user's device answers the same) |
+
 **Client IP:** `request.client.host` comes from `X-Forwarded-For`, believed only from `TRUSTED_PROXIES`
 (the ingress in the pod network `10.42.0.0/16`). HAProxy appends to whatever the client sent, so the app
 takes the rightmost untrusted address (uvicorn's `ProxyHeadersMiddleware`, added in `create_app()`;
@@ -368,7 +414,9 @@ IDs are UUIDv7 generated by the app (no database default). All times are `timest
 | `refresh_tokens` ✅ | `id uuid PK`, `device_id FK → devices ON DELETE CASCADE` (indexed), `token_hash bytea UNIQUE`, `created_at`, `expires_at`, `used_at`, `discarded_at` | SHA-256 of the token only. Waiting = `used_at` empty; current = used, not discarded; discarded = replaced. Rules in §7 |
 | `sms_daily_usage` ✅ | `day date PK` (UTC), `sent int` (check `>= 0`) | Global daily SMS cap. Kept in Postgres, **not** Redis, so a Redis restart can't reset the money guard |
 
-Per-phone and per-IP rate limits live in Redis db 1 (losing them on a restart is acceptable).
+Per-phone and per-IP rate limits live in Redis db 1 (losing them on a restart is acceptable). Revoked
+devices for chat-service live in the shared Redis db 2 (`services/revocation.py`, §7), rebuilt from
+`devices.revoked_at` every minute.
 An hourly loop in every pod (`services/cleanup.cleanup_loop`, started in `main.lifespan`; harmless to run
 twice) deletes `otp_challenges` rows older than 24 h, devices revoked more than 30 days ago (their refresh
 tokens go with them), expired refresh tokens and refresh tokens discarded more than 7 days ago.
@@ -412,6 +460,8 @@ Later: `device_links` for linking secondary devices by QR code (PLAN.md, "Later"
 | `DATABASE_URL` | – | `postgresql://user:pass@host:5432/db` (Secret `auth-db` in the cluster) |
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | `5` / `5` | Connections per pod: at most 10 × 2 pods, against Postgres' `max_connections=50` |
 | `REDIS_URL` | – | `redis://redis:6379/1` in the cluster. Unset/unreachable → `otp/request` answers 503 |
+| `SHARED_REDIS_URL` | – | `redis://redis:6379/2` in the cluster: the Redis db shared by the services (revoked devices for chat-service). Unset → nothing is published |
+| `REVOKED_KEY_TTL_SECONDS` / `REVOKED_SYNC_INTERVAL_SECONDS` | `1020` / `60` | A revoked device's key lives 17 min after the revocation / how often every pod rewrites recent keys |
 | `OTP_PEPPER` | – | Secret key for code hashes (Secret `auth-otp`). Unset → `otp/request` answers 503 |
 | `TRUSTED_PROXIES` | `["10.42.0.0/16"]` | Who may set `X-Forwarded-For` (JSON list) |
 | `OTP_TTL_SECONDS` / `OTP_RESEND_COOLDOWN_SECONDS` | `300` / `60` | Code lifetime / resend cooldown |
@@ -502,14 +552,16 @@ Each step is small, tested and deployed before the next.
    and must send a display name before a user exists) + WhatsApp device model (one primary phone per user,
    a new SMS login replaces it; `devices.role`, migrations 0003 + 0004). Deployed 2026-10-29.
 6. Refresh tokens, in two parts:
-   - 🔨 6a: `refresh_tokens` (migration 0005), tokens returned at login/register, `POST /auth/token/refresh`
-     (rotation, lost replies, reuse detection), cleanup.
-   - 6b: access-token dependency (`CurrentDevice`), `POST /auth/logout`, `GET/DELETE /auth/devices`.
+   - ✅ 6a: `refresh_tokens` (migration 0005), tokens returned at login/register, `POST /auth/token/refresh`
+     (rotation, lost replies, reuse detection), cleanup. Deployed 2026-10-30.
+   - 🔨 6b: access-token dependency (`CurrentDevice`), `POST /auth/logout`, `GET/DELETE /auth/devices`,
+     revoked devices published in the shared Redis (db 2) for chat-service.
 7. Tracing (OpenTelemetry → Tempo) + metrics.
 8. Dummy Expo app against it (PLAN.md phase 8).
 9. ✅ Real SMS provider: done as part of step 3 (Global SMS, per-provider settings in `config.py`).
 10. Linking devices by QR (after step 6): `device_links`, `POST /auth/link/start` + `/link/approve`, up to 4
-    `linked` devices; then decide whether a new primary login also signs out linked devices.
+    `linked` devices; then decide whether a new primary login (or a primary logout) also signs out
+    linked devices.
 
 ## 14. Deployment
 - Push to `main` → GitHub Actions (ARM runner): checks → image
