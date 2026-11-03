@@ -15,6 +15,7 @@ from auth_service.api import health
 from auth_service.api.errors import register_error_handlers
 from auth_service.api.router import api_router
 from auth_service.config import get_settings
+from auth_service.core import tracing
 from auth_service.core.logging import setup_logging
 from auth_service.db.engine import Database
 from auth_service.services.cleanup import Retention, cleanup_loop
@@ -33,8 +34,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.keys = make_signing_keys(settings)
     app.state.db = None
     app.state.redis = None
-    app.state.sms = make_sms_sender(settings)
     tasks: list[asyncio.Task[None]] = []
+    if settings.database_url:
+        app.state.db = Database(
+            settings.database_url, settings.db_pool_size, settings.db_max_overflow
+        )
+    # Before any Redis or httpx client is created (they are patched for the whole process).
+    provider = app.state.tracer_provider
+    if provider is not None:
+        tracing.instrument_libraries(provider, app.state.db.engine if app.state.db else None)
+    app.state.sms = make_sms_sender(settings)
 
     # The Redis db shared with chat-service (revoked devices). auth only writes there.
     shared_redis = None
@@ -48,10 +57,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         shared_redis, timedelta(seconds=settings.revoked_key_ttl_seconds)
     )
 
-    if settings.database_url:
-        app.state.db = Database(
-            settings.database_url, settings.db_pool_size, settings.db_max_overflow
-        )
+    if app.state.db is not None:
         tasks.append(
             asyncio.create_task(cleanup_loop(app.state.db, Retention.from_settings(settings)))
         )
@@ -93,6 +99,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await shared_redis.aclose()
     if app.state.db is not None:
         await app.state.db.dispose()
+    if provider is not None:
+        await tracing.shutdown(provider)  # send the spans still waiting
     log.info("stopped")
 
 
@@ -117,6 +125,10 @@ def create_app() -> FastAPI:
     register_error_handlers(app)
     app.include_router(health.router)
     app.include_router(api_router)
+    # Tracing (off without OTEL_EXPORTER_OTLP_ENDPOINT). The libraries are hooked in lifespan().
+    app.state.tracer_provider = tracing.make_tracer_provider(settings)
+    if app.state.tracer_provider is not None:
+        tracing.instrument_app(app, app.state.tracer_provider)
     return app
 
 

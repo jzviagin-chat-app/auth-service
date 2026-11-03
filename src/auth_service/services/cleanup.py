@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from auth_service.config import Settings
+from auth_service.core.tracing import tracer
 from auth_service.db import repos
 from auth_service.db.engine import Database
 
@@ -66,19 +67,20 @@ async def cleanup_loop(db: Database, retention: Retention) -> None:
     """Runs for the life of the process (started in main.lifespan), like a setInterval in Node."""
     while True:
         try:
-            challenges = await delete_old_challenges(db, retention.otp_challenges)
-            devices = await delete_old_devices(db, retention.revoked_devices)
-            tokens = await delete_old_refresh_tokens(db, retention.replaced_refresh_tokens)
-            if challenges or devices or tokens:
-                log.info(
-                    "cleanup",
-                    extra={
-                        "otp_challenges": challenges,
-                        "devices": devices,
-                        "refresh_tokens": tokens,
-                    },
-                )
+            with tracer.start_as_current_span("cleanup"):  # one trace per round, not per query
+                await _cleanup(db, retention)
         except Exception:
             # Keep the loop alive (e.g. Postgres restarting); try again next round.
             log.exception("cleanup failed")
         await asyncio.sleep(retention.interval_seconds)
+
+
+async def _cleanup(db: Database, retention: Retention) -> None:
+    challenges = await delete_old_challenges(db, retention.otp_challenges)
+    devices = await delete_old_devices(db, retention.revoked_devices)
+    tokens = await delete_old_refresh_tokens(db, retention.replaced_refresh_tokens)
+    if challenges or devices or tokens:
+        log.info(
+            "cleanup",
+            extra={"otp_challenges": challenges, "devices": devices, "refresh_tokens": tokens},
+        )

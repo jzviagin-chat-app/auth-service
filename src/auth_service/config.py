@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     environment: Literal["dev", "prod"] = "prod"
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     pod_name: str = "local"  # set by Kubernetes (k8s/auth.yaml)
+    # Where traces go (core/tracing.py): http://alloy.observability.svc:4317 in the cluster (OTLP
+    # over gRPC). The standard OpenTelemetry variable name. Unset -> no tracing.
+    otel_exporter_otlp_endpoint: str | None = None
 
     # postgresql://user:password@host:5432/db (the Secret "auth-db" provides it in the cluster).
     # Optional until the first handler needs the database.

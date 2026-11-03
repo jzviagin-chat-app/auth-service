@@ -44,6 +44,7 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session, SessionTransaction
 
+from auth_service.core.tracing import tracer
 from auth_service.db import repos
 from auth_service.db.engine import Database
 
@@ -181,7 +182,8 @@ async def resync_loop(db: Database, revoked: RevokedDevices, interval_seconds: i
     """Runs for the life of the process (started in main.lifespan); every pod runs it."""
     while True:
         try:
-            await revoked.resync(db)
+            with tracer.start_as_current_span("revoked devices resync"):  # one trace per round
+                await revoked.resync(db)
         except Exception:
             # Keep the loop alive (Redis or Postgres restarting); try again next round.
             log.exception("revoked devices resync failed")
