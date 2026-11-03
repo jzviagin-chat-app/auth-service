@@ -19,5 +19,14 @@ services:
     command: ["--save", "", "--appendonly", "no"]
     ports:
       - "6379:6379"
+  # Optional, to see traces locally (the cluster uses Alloy -> Tempo -> Grafana instead):
+  #   docker compose --profile tracing up -d jaeger
+  #   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 in .env, then open http://localhost:16686
+  jaeger:
+    image: jaegertracing/jaeger:2.22.0
+    profiles: ["tracing"]
+    ports:
+      - "4317:4317"     # OTLP over gRPC (what the app sends)
+      - "16686:16686"   # web UI
 volumes:
   pgdata:

@@ -1,6 +1,7 @@
 """JSON logs: one JSON object per line on stdout, which Alloy ships to Loki.
 
-Rules (docs/OBSERVABILITY.md in chat-infra): include `level` and `msg`; later also `trace_id`.
+Rules (docs/OBSERVABILITY.md in chat-infra): include `level` and `msg`, and `trace_id` when the line
+is written inside a traced request (core/tracing.py): Grafana links it to the trace in Tempo.
 Never log OTP codes, tokens or full phone numbers.
 """
 
@@ -9,6 +10,8 @@ import logging
 import sys
 from datetime import UTC, datetime
 from typing import Any, override
+
+from opentelemetry import trace
 
 # Attributes every LogRecord has; anything else was passed via `extra=` and is logged as a field.
 _STANDARD_ATTRS = set(logging.makeLogRecord({}).__dict__) | {
@@ -33,6 +36,12 @@ class JsonFormatter(logging.Formatter):
             "msg": record.getMessage(),
             **self._static,
         }
+        # The span being handled right now (from a contextvar, so it follows the request across
+        # awaits). With tracing off there is never a valid one, and the fields are left out.
+        span = trace.get_current_span().get_span_context()
+        if span.is_valid:
+            entry["trace_id"] = trace.format_trace_id(span.trace_id)
+            entry["span_id"] = trace.format_span_id(span.span_id)
         for key, value in record.__dict__.items():
             if key not in _STANDARD_ATTRS and not key.startswith("_"):
                 entry[key] = value

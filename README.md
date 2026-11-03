@@ -5,7 +5,8 @@ service (chat-service first) uses to know **who** is calling and **from which de
 
 > **Status: sign-up, login, sessions.** `POST /auth/otp/request` sends real SMS codes (Global SMS),
 > `otp/verify` + `register` log users in with access + refresh tokens, `token/refresh` keeps them logged in,
-> `logout` and `devices` sign devices out. Tracing comes next (see [Build plan](#13-build-plan)).
+> `logout` and `devices` sign devices out, and every request is traced (OpenTelemetry → Tempo). Metrics come
+> next (see [Build plan](#13-build-plan)).
 
 ---
 
@@ -57,7 +58,8 @@ service (chat-service first) uses to know **who** is calling and **from which de
 | Tests | **pytest** + pytest-asyncio + httpx | jest / vitest + supertest | `async def` tests; the app is called in-process |
 | Lint + format | **ruff** | eslint + prettier | One fast tool for both |
 | Type check | **mypy** (strict) | `tsc --noEmit` | Catches type errors before runtime |
-| Later | PyJWT + cryptography, redis-py (asyncio), httpx, OpenTelemetry | jose, ioredis, fetch, @opentelemetry | Added in the step that needs them |
+| Tracing | **OpenTelemetry** SDK + one instrumentation package per library (FastAPI, SQLAlchemy, redis, httpx) | @opentelemetry/sdk-node + auto-instrumentations | Vendor-neutral standard; Alloy/Tempo already speak it |
+| Also | PyJWT + cryptography, redis-py (asyncio), httpx | jose, ioredis, fetch | Tokens, Redis, the SMS provider's API |
 
 **Python vs TypeScript types:** type hints are *not* checked when the code runs, just like TS types
 disappear after compilation. `mypy` checks them before running (in CI); **Pydantic** is what actually
@@ -129,7 +131,8 @@ auth-service/
 │   │   ├── models.py       #   tables
 │   │   └── repos.py        #   data access functions (the only SQL)
 │   └── core/
-│       ├── logging.py      #   JSON logs to stdout
+│       ├── logging.py      #   JSON logs to stdout (with trace_id inside a request)
+│       ├── tracing.py      #   OpenTelemetry: provider, exporter to Alloy, library instrumentations
 │       ├── hashing.py      #   random secret tokens + their SHA-256 (registration, refresh)
 │       └── masking.py      #   mask_phone() for logs
 └── tests/
@@ -143,6 +146,7 @@ auth-service/
     ├── test_refresh.py     # POST /auth/token/refresh: rotation, lost replies, reuse, cleanup
     ├── test_devices.py     # CurrentDevice, logout, devices list/remove, revoked devices in Redis
     ├── test_tokens.py      # signing keys, access tokens, jwks.json
+    ├── test_tracing.py     # spans per request/query/command, trace_id in logs, no secrets in spans
     └── test_migrations.py  # migrations + constraints against real Postgres
 ```
 
@@ -203,7 +207,18 @@ automatically. `CurrentDevice` gives a route the logged-in caller the same way:
 ```
 Alloy ships these to Loki, so in Grafana you query `{app="auth"} | json | level="error"`.
 Extra fields: `log.info("otp sent", extra={"phone": masked})`. Health-check access lines are dropped.
-Later each line also gets `trace_id`, linked to its trace in Tempo.
+A line written while a request is handled also has `trace_id` and `span_id` (tracing on), so in Grafana a log
+line links to its trace in Tempo, and back.
+
+**Tracing** (`core/tracing.py`): with `OTEL_EXPORTER_OTLP_ENDPOINT` set, every request becomes a trace: a span
+for the HTTP request and, inside it, one per Postgres query, Redis command and outgoing HTTP call (Global
+SMS), with their durations. We don't write these spans: one OpenTelemetry *instrumentation* package per
+library hooks into it (FastAPI: a middleware; SQLAlchemy: its query events; redis and httpx: their methods are
+wrapped at startup). The current span lives in a `contextvar` (≈ `AsyncLocalStorage`), so every query made
+for a request becomes its child. The background loops (cleanup, revoked-devices resync) make one span per
+round (`tracer` in `core/tracing.py`). Spans are sent in batches by a background thread to Alloy
+(`alloy.observability.svc:4317`), which passes them to Tempo; if Alloy is down they are dropped, requests never
+wait. Health checks aren't traced. Unset → no tracing (local default, CI).
 
 ## 7. Sessions: access + refresh tokens
 
@@ -437,6 +452,9 @@ Later: `device_links` for linking secondary devices by QR code (PLAN.md, "Later"
   phone, and SMS senders raise `SmsSendError` with a short status, never the provider's error text.
   `test_logs_never_contain_the_phone_or_code` checks every path. Only `ENVIRONMENT=dev` lets the fake
   sender log the message text (so you can read the code locally).
+- **Traces** never hold them either: SQL is recorded with placeholders (`$1`), never values; Redis commands
+  as `SET ? ?`; outgoing calls by URL (the Global SMS key is in the body); requests by method, route and
+  status, never bodies. `test_spans_never_contain_the_phone_codes_or_tokens` checks a whole sign-up.
 - OTP codes: 6 digits from `secrets`, stored as `HMAC-SHA256(OTP_PEPPER, "phone:code")`. They are compared in
   constant time (`hmac.compare_digest`), expire after 5 minutes, are invalidated after 5 wrong tries,
   and work once.
@@ -456,7 +474,8 @@ Later: `device_links` for linking secondary devices by QR code (PLAN.md, "Later"
 |---|---|---|
 | `ENVIRONMENT` | `prod` | `dev` enables `/auth/docs` |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
-| `POD_NAME` | `local` | Set by Kubernetes; added to every log line |
+| `POD_NAME` | `local` | Set by Kubernetes; added to every log line and trace |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | – | Where traces go (OTLP over gRPC): `http://alloy.observability.svc:4317` in the cluster. Unset → no tracing |
 | `DATABASE_URL` | – | `postgresql://user:pass@host:5432/db` (Secret `auth-db` in the cluster) |
 | `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | `5` / `5` | Connections per pod: at most 10 × 2 pods, against Postgres' `max_connections=50` |
 | `REDIS_URL` | – | `redis://redis:6379/1` in the cluster. Unset/unreachable → `otp/request` answers 503 |
@@ -515,6 +534,10 @@ Database tests run only when `TEST_DATABASE_URL` is set, and the OTP tests also 
 in `.env.example`; CI sets them too). They wipe that database and Redis db 15, so these must never be the ones
 you develop against. Without them they are skipped (`uv run pytest -rs` shows why).
 
+To see traces locally: `docker compose --profile tracing up -d jaeger`, set
+`OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317` in `.env`, restart the app, open http://localhost:16686
+(Jaeger: a small trace viewer standing in for Tempo + Grafana).
+
 Try the endpoint locally (with `ENVIRONMENT=dev` the fake sender logs the code):
 ```bash
 curl -i -X POST localhost:8000/auth/otp/request -H 'content-type: application/json' -d '{"phone":"+972501234567"}'
@@ -554,9 +577,11 @@ Each step is small, tested and deployed before the next.
 6. Refresh tokens, in two parts:
    - ✅ 6a: `refresh_tokens` (migration 0005), tokens returned at login/register, `POST /auth/token/refresh`
      (rotation, lost replies, reuse detection), cleanup. Deployed 2026-10-30.
-   - 🔨 6b: access-token dependency (`CurrentDevice`), `POST /auth/logout`, `GET/DELETE /auth/devices`,
-     revoked devices published in the shared Redis (db 2) for chat-service.
-7. Tracing (OpenTelemetry → Tempo) + metrics.
+   - ✅ 6b: access-token dependency (`CurrentDevice`), `POST /auth/logout`, `GET/DELETE /auth/devices`,
+     revoked devices published in the shared Redis (db 2) for chat-service. Deployed 2026-11-02.
+7. Observability, in two parts:
+   - 🔨 7a: tracing (OpenTelemetry → Alloy → Tempo), `trace_id` on log lines.
+   - 7b: metrics (`/metrics` for Prometheus).
 8. Dummy Expo app against it (PLAN.md phase 8).
 9. ✅ Real SMS provider: done as part of step 3 (Global SMS, per-provider settings in `config.py`).
 10. Linking devices by QR (after step 6): `device_links`, `POST /auth/link/start` + `/link/approve`, up to 4
