@@ -13,6 +13,7 @@ from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import SpanKind
 
 from auth_service.config import Settings, get_settings
 from auth_service.core import tracing
@@ -99,7 +100,9 @@ async def test_health_checks_are_not_traced(
     async with http(traced) as c:
         assert (await c.get("/healthz")).status_code == 200
         assert (await c.get("/auth/healthz")).status_code == 200
-    assert exporter.get_finished_spans() == ()
+    # No request span. (Not "no spans at all": the background loops' first round runs at startup
+    # and its query spans can land here on a slow machine. The health routes do no I/O.)
+    assert [s for s in exporter.get_finished_spans() if s.kind == SpanKind.SERVER] == []
 
 
 async def test_log_lines_carry_the_trace_id(
