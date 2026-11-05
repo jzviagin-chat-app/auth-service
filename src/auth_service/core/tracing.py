@@ -35,8 +35,9 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from auth_service.config import Settings
 
-# Kubernetes probes call these every few seconds: no traces for them (regexes on the URL).
-EXCLUDED_URLS = "/healthz$"
+# Kubernetes probes and Prometheus call these all the time: no traces for them (comma-separated
+# regexes on the URL).
+EXCLUDED_URLS = "/healthz$,/metrics$"
 
 # For our own spans, where no library makes one: the background loops (cleanup, revoked-devices
 # resync), so each round is one trace instead of a loose trace per query. It forwards to the

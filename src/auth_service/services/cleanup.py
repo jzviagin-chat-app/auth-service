@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from auth_service.config import Settings
+from auth_service.core.metrics import JOB_RUNS
 from auth_service.core.tracing import tracer
 from auth_service.db import repos
 from auth_service.db.engine import Database
@@ -69,9 +70,11 @@ async def cleanup_loop(db: Database, retention: Retention) -> None:
         try:
             with tracer.start_as_current_span("cleanup"):  # one trace per round, not per query
                 await _cleanup(db, retention)
+            JOB_RUNS.labels("cleanup", "ok").inc()
         except Exception:
             # Keep the loop alive (e.g. Postgres restarting); try again next round.
             log.exception("cleanup failed")
+            JOB_RUNS.labels("cleanup", "error").inc()
         await asyncio.sleep(retention.interval_seconds)
 
 

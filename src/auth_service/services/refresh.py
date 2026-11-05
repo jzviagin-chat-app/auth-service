@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth_service.config import Settings
 from auth_service.core.hashing import hash_secret, new_secret_token
+from auth_service.core.metrics import REFRESHES
 from auth_service.db import repos
 from auth_service.services.devices import AccountBlocked, LoggedIn
 from auth_service.services.revocation import RevokedDevices, revoke_device
@@ -99,13 +100,16 @@ async def refresh(
         await revoke_device(session, revoked, device_id, now, "refresh_token_reused")
         await session.commit()
         log.warning("refresh token reused: device signed out", extra=log_ids)
+        REFRESHES.labels("reused").inc()
         raise InvalidRefreshToken("reused")
     if user_status != "active":
         await session.rollback()
         log.warning("refresh refused: account blocked", extra=log_ids)
+        REFRESHES.labels("blocked").inc()
         raise AccountBlocked
 
     live = await repos.live_refresh_tokens(session, device_id)
+    outcome = "rotated" if found.used_at is None else "retried"
     if found.used_at is None:
         # A waiting token: the app got it, so everything else of this device is dead now.
         found.used_at = now
@@ -127,6 +131,7 @@ async def refresh(
 
     access_token, expires_in = tokens.issue(user_id=user_id, device_id=device_id)
     log.info("tokens refreshed", extra=log_ids)
+    REFRESHES.labels(outcome).inc()
     return LoggedIn(user_id, device_id, access_token, expires_in, new_token)
 
 
@@ -135,4 +140,5 @@ async def _reject(
 ) -> NoReturn:
     await session.rollback()
     log.info("refresh token rejected", extra={"reason": reason, **(log_ids or {})})
+    REFRESHES.labels(reason).inc()
     raise InvalidRefreshToken(reason)

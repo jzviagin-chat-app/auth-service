@@ -17,6 +17,7 @@ from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth_service.core.masking import mask_phone
+from auth_service.core.metrics import LOGINS
 from auth_service.db import repos
 from auth_service.services.devices import (
     AccountBlocked,
@@ -75,6 +76,7 @@ async def verify_code(
     ):
         await session.rollback()
         log.info("otp code expired", extra={"phone": masked})
+        LOGINS.labels("code_expired").inc()
         raise CodeExpired
 
     # compare_digest takes the same time wherever the bytes differ, so response timing can't
@@ -84,6 +86,7 @@ async def verify_code(
         await session.commit()
         attempts_left = MAX_ATTEMPTS - challenge.attempts
         log.warning("otp wrong code", extra={"phone": masked, "attempts_left": attempts_left})
+        LOGINS.labels("invalid_code").inc()
         if attempts_left == 0:
             raise CodeExpired  # nothing left to retry: tell the app to request a new code now
         raise InvalidCode(attempts_left)
@@ -95,11 +98,13 @@ async def verify_code(
         result = start_registration(challenge, now)
         await session.commit()
         log.info("registration required", extra={"phone": masked})
+        LOGINS.labels("registration_required").inc()
         return result
 
     if user.status != "active":
         await session.commit()  # the code is used up all the same
         log.warning("login refused: account blocked", extra={"user_id": str(user.id)})
+        LOGINS.labels("blocked").inc()
         raise AccountBlocked
 
     user_id = user.id
@@ -116,4 +121,5 @@ async def verify_code(
             "phone": masked,
         },
     )
+    LOGINS.labels("logged_in").inc()
     return LoggedIn(user_id, new_device_id, access_token, expires_in, refresh_token)

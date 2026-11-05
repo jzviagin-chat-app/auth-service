@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth_service.core.hashing import hash_secret, new_secret_token
 from auth_service.core.masking import mask_phone
+from auth_service.core.metrics import LOGINS
 from auth_service.db import repos
 from auth_service.db.models import OtpChallenge
 from auth_service.services.devices import DeviceInfo, LoggedIn, add_primary, check_sms_platform
@@ -72,6 +73,7 @@ async def register(
     ):
         await session.rollback()
         log.info("registration token rejected")
+        LOGINS.labels("invalid_registration_token").inc()
         raise InvalidRegistrationToken
 
     # Read before a possible rollback: a rollback empties loaded objects (reading them again would
@@ -92,6 +94,7 @@ async def register(
         # phone_e164 is UNIQUE: someone registered this number first. Nothing was saved.
         await session.rollback()
         log.warning("register refused: already registered", extra={"phone": masked})
+        LOGINS.labels("already_registered").inc()
         raise AlreadyRegistered from None
 
     access_token, expires_in = tokens.issue(user_id=user_id, device_id=device_id)
@@ -99,4 +102,5 @@ async def register(
         "user registered",
         extra={"user_id": str(user_id), "device_id": str(device_id), "phone": masked},
     )
+    LOGINS.labels("registered").inc()
     return LoggedIn(user_id, device_id, access_token, expires_in, refresh_token)
