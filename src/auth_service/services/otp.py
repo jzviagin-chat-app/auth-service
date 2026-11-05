@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth_service.config import Settings
 from auth_service.core.masking import mask_phone
+from auth_service.core.metrics import OTP_REQUESTS, SMS_SENT
 from auth_service.db import repos
 from auth_service.services.rate_limit import (
     Limits,
@@ -127,6 +128,7 @@ async def request_code(
 ) -> None:
     """Send a new code to `phone`, or raise InvalidPhone / RateLimited / SmsUnavailable."""
     if not is_israeli_mobile(phone):
+        OTP_REQUESTS.labels("invalid_phone").inc()
         raise InvalidPhone
     masked = mask_phone(phone)
     ip = clean_ip(ip)
@@ -137,15 +139,18 @@ async def request_code(
         await check_and_count(redis, policy.limits, phone_ref(pepper, phone), ip or "unknown")
     except RateLimited as e:
         log.warning("otp rate limited", extra={"phone": masked, "ip": ip, "limit": e.limit})
+        OTP_REQUESTS.labels(f"rate_limited_{e.limit}").inc()
         raise
     except LimitsUnavailable as e:
         log.error("rate limiter unavailable", extra={"error_type": str(e)})
+        OTP_REQUESTS.labels("limiter_unavailable").inc()
         raise SmsUnavailable("rate_limiter_unavailable") from e
 
     # 2. Global daily cap + the challenge row, in one transaction.
     if not await repos.reserve_daily_sms(session, now.date(), policy.daily_cap):
         await session.rollback()
         log.error("sms daily cap reached", extra={"cap": policy.daily_cap})
+        OTP_REQUESTS.labels("daily_cap").inc()
         raise SmsUnavailable("daily_cap")
     code = new_code()
     await repos.insert_otp_challenge(
@@ -164,5 +169,9 @@ async def request_code(
         log.error(
             "sms send failed", extra={"phone": masked, "provider": sms.name, "status": e.status}
         )
+        SMS_SENT.labels(sms.name, e.status).inc()
+        OTP_REQUESTS.labels("send_failed").inc()
         raise SmsUnavailable("send_failed") from e
     log.info("sms sent", extra={"phone": masked, "provider": sms.name, "message_id": message_id})
+    SMS_SENT.labels(sms.name, "ok").inc()
+    OTP_REQUESTS.labels("sent").inc()

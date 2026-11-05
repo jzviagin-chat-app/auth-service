@@ -11,12 +11,13 @@ from fastapi import FastAPI
 from redis.asyncio import Redis
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
-from auth_service.api import health
+from auth_service.api import health, metrics
 from auth_service.api.errors import register_error_handlers
 from auth_service.api.router import api_router
 from auth_service.config import get_settings
 from auth_service.core import tracing
 from auth_service.core.logging import setup_logging
+from auth_service.core.metrics import MetricsMiddleware
 from auth_service.db.engine import Database
 from auth_service.services.cleanup import Retention, cleanup_loop
 from auth_service.services.keys import make_signing_keys
@@ -122,8 +123,10 @@ def create_app() -> FastAPI:
     # this takes the rightmost address that isn't a trusted proxy = the one HAProxy added.
     # (uvicorn's own --proxy-headers is turned off in the Dockerfile; this is the one place.)
     app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=settings.trusted_proxies)
+    app.add_middleware(MetricsMiddleware)  # request counts and timings, read at /metrics
     register_error_handlers(app)
     app.include_router(health.router)
+    app.include_router(metrics.router)
     app.include_router(api_router)
     # Tracing (off without OTEL_EXPORTER_OTLP_ENDPOINT). The libraries are hooked in lifespan().
     app.state.tracer_provider = tracing.make_tracer_provider(settings)

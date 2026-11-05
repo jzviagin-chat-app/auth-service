@@ -44,6 +44,7 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session, SessionTransaction
 
+from auth_service.core.metrics import DEVICES_REVOKED, JOB_RUNS
 from auth_service.core.tracing import tracer
 from auth_service.db import repos
 from auth_service.db.engine import Database
@@ -55,7 +56,7 @@ MARKER = "revoked:synced"
 MARKER_TTL_SECONDS = 180
 WRITE_TRIES = 3
 WRITE_BUDGET_SECONDS = 1.0  # all tries together, so a dead Redis can't pile up slow tasks
-PENDING = "revoked_devices"  # our key in session.info: (RevokedDevices, [device ids])
+PENDING = "revoked_devices"  # our key in session.info: (RevokedDevices, [(id, at, reason)])
 
 
 def device_key(device_id: uuid.UUID) -> str:
@@ -144,13 +145,14 @@ async def revoke_device(
     reason: str,
 ) -> bool:
     """Sign the device out in Postgres; False if it already was (or doesn't exist). The caller
-    commits; the Redis write follows the commit by itself. `reason` is for the logs."""
+    commits; the Redis write follows the commit by itself. `reason` is for the logs and the
+    auth_devices_revoked_total metric."""
     if not await repos.revoke_device(session, device_id, now):
         return False
     log.info("device signed out", extra={"device_id": str(device_id), "reason": reason})
     if PENDING not in session.info:
         session.info[PENDING] = (revoked, [])
-    session.info[PENDING][1].append((device_id, now))
+    session.info[PENDING][1].append((device_id, now, reason))
     return True
 
 
@@ -167,7 +169,9 @@ def _publish_after_commit(session: Session) -> None:
     pending = session.info.pop(PENDING, None)
     if pending is not None:
         revoked, devices = pending
-        revoked.publish_in_background(devices)
+        for _, _, reason in devices:
+            DEVICES_REVOKED.labels(reason).inc()  # counted here: a rolled-back one never happened
+        revoked.publish_in_background([(device_id, at) for device_id, at, _ in devices])
 
 
 @event.listens_for(Session, "after_soft_rollback")
@@ -184,7 +188,9 @@ async def resync_loop(db: Database, revoked: RevokedDevices, interval_seconds: i
         try:
             with tracer.start_as_current_span("revoked devices resync"):  # one trace per round
                 await revoked.resync(db)
+            JOB_RUNS.labels("revoked_resync", "ok").inc()
         except Exception:
             # Keep the loop alive (Redis or Postgres restarting); try again next round.
             log.exception("revoked devices resync failed")
+            JOB_RUNS.labels("revoked_resync", "error").inc()
         await asyncio.sleep(interval_seconds)

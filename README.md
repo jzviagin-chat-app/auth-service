@@ -5,8 +5,8 @@ service (chat-service first) uses to know **who** is calling and **from which de
 
 > **Status: sign-up, login, sessions.** `POST /auth/otp/request` sends real SMS codes (Global SMS),
 > `otp/verify` + `register` log users in with access + refresh tokens, `token/refresh` keeps them logged in,
-> `logout` and `devices` sign devices out, and every request is traced (OpenTelemetry → Tempo). Metrics come
-> next (see [Build plan](#13-build-plan)).
+> `logout` and `devices` sign devices out, every request is traced (OpenTelemetry → Tempo) and counted
+> (`/metrics` for Prometheus). Next: the dummy Expo app (see [Build plan](#13-build-plan)).
 
 ---
 
@@ -59,6 +59,7 @@ service (chat-service first) uses to know **who** is calling and **from which de
 | Lint + format | **ruff** | eslint + prettier | One fast tool for both |
 | Type check | **mypy** (strict) | `tsc --noEmit` | Catches type errors before runtime |
 | Tracing | **OpenTelemetry** SDK + one instrumentation package per library (FastAPI, SQLAlchemy, redis, httpx) | @opentelemetry/sdk-node + auto-instrumentations | Vendor-neutral standard; Alloy/Tempo already speak it |
+| Metrics | **prometheus_client** (the official Prometheus library) | prom-client | Prometheus reads `/metrics` (pull); counters live in memory |
 | Also | PyJWT + cryptography, redis-py (asyncio), httpx | jose, ioredis, fetch | Tokens, Redis, the SMS provider's API |
 
 **Python vs TypeScript types:** type hints are *not* checked when the code runs, just like TS types
@@ -104,6 +105,7 @@ auth-service/
 │   ├── config.py           # Settings from env vars (pydantic-settings), get_settings()
 │   ├── api/                # HTTP layer
 │   │   ├── health.py       #   /healthz, /auth/healthz
+│   │   ├── metrics.py      #   /metrics (Prometheus; not under /auth, so not public)
 │   │   ├── router.py       #   mounts all feature routers under /auth
 │   │   ├── errors.py       #   the {"error", "message"} shape for every error
 │   │   ├── deps.py         #   dependencies routes receive (DbSession, OtpContextDep, LoginContextDep,
@@ -133,6 +135,7 @@ auth-service/
 │   └── core/
 │       ├── logging.py      #   JSON logs to stdout (with trace_id inside a request)
 │       ├── tracing.py      #   OpenTelemetry: provider, exporter to Alloy, library instrumentations
+│       ├── metrics.py      #   all metrics (counters, histogram) + the request-counting middleware
 │       ├── hashing.py      #   random secret tokens + their SHA-256 (registration, refresh)
 │       └── masking.py      #   mask_phone() for logs
 └── tests/
@@ -147,6 +150,7 @@ auth-service/
     ├── test_devices.py     # CurrentDevice, logout, devices list/remove, revoked devices in Redis
     ├── test_tokens.py      # signing keys, access tokens, jwks.json
     ├── test_tracing.py     # spans per request/query/command, trace_id in logs, no secrets in spans
+    ├── test_metrics.py     # /metrics, counts by route template and outcome, no secrets in metrics
     └── test_migrations.py  # migrations + constraints against real Postgres
 ```
 
@@ -218,7 +222,24 @@ wrapped at startup). The current span lives in a `contextvar` (≈ `AsyncLocalSt
 for a request becomes its child. The background loops (cleanup, revoked-devices resync) make one span per
 round (`tracer` in `core/tracing.py`). Spans are sent in batches by a background thread to Alloy
 (`alloy.observability.svc:4317`), which passes them to Tempo; if Alloy is down they are dropped, requests never
-wait. Health checks aren't traced. Unset → no tracing (local default, CI).
+wait. Health checks and `/metrics` aren't traced. Unset → no tracing (local default, CI).
+
+**Metrics** (`core/metrics.py`): totals over time, where a trace is one request. Each pod keeps counters in
+memory and serves them as text at `GET /metrics`; Prometheus reads every pod's page every 60 s (the pod
+annotations in `k8s/auth.yaml` tell it to) and Grafana graphs them (≈ prom-client + an Express route). Counters
+only go up and restart from 0 with the pod; queries use `rate()` / `increase()`, which handle that.
+- `http_requests_total{method, route, status}`, `http_request_duration_seconds{method, route}` (histogram):
+  every request except health checks and `/metrics`, by route template (`/auth/devices/{device_id}`).
+- `auth_otp_requests_total{outcome}` (`sent`, `rate_limited_<limit>`, `daily_cap`, `send_failed`, …),
+  `auth_sms_sent_total{provider, result}`, `auth_logins_total{outcome}` (verify + register),
+  `auth_refresh_total{outcome}` (`rotated`, `retried`, `reused`, reject reasons),
+  `auth_devices_revoked_total{reason}` (counted after the commit), `auth_job_runs_total{job, result}`
+  (cleanup, resync: a loop that keeps failing shows up).
+- Plus the library's own `process_*` (memory, CPU, open files) and `python_gc_*`.
+
+Example queries: `sum by (route) (rate(http_requests_total{app="auth"}[5m]))`,
+`increase(auth_otp_requests_total[1d])`, `histogram_quantile(0.95, sum by (le, route)
+(rate(http_request_duration_seconds_bucket[5m])))`.
 
 ## 7. Sessions: access + refresh tokens
 
@@ -313,6 +334,7 @@ and mobile apps don't handle cookies well. Why not one long-lived JWT: it can't 
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/healthz`, `/auth/healthz` | – | Health checks ✅ |
+| GET | `/metrics` | – (inside the cluster only) | Prometheus metrics ✅ |
 | POST | `/auth/otp/request` | – | Send an SMS code ✅. Same `202` for every number, registered or not. Rate limited (below) |
 | POST | `/auth/otp/verify` | – | Check the code → logged in, or registration required ✅ |
 | POST | `/auth/register` | registration token | New number: display name → user + device + token ✅ |
@@ -455,6 +477,9 @@ Later: `device_links` for linking secondary devices by QR code (PLAN.md, "Later"
 - **Traces** never hold them either: SQL is recorded with placeholders (`$1`), never values; Redis commands
   as `SET ? ?`; outgoing calls by URL (the Global SMS key is in the body); requests by method, route and
   status, never bodies. `test_spans_never_contain_the_phone_codes_or_tokens` checks a whole sign-up.
+- **Metrics** labels hold only fixed values (route template, status, outcome), never a phone number, code,
+  token or id (`test_sign_up_is_counted_and_never_exposed`). `/metrics` isn't under `/auth`, so the ingress
+  never sends it here from the internet.
 - OTP codes: 6 digits from `secrets`, stored as `HMAC-SHA256(OTP_PEPPER, "phone:code")`. They are compared in
   constant time (`hmac.compare_digest`), expire after 5 minutes, are invalidated after 5 wrong tries,
   and work once.
@@ -580,8 +605,8 @@ Each step is small, tested and deployed before the next.
    - ✅ 6b: access-token dependency (`CurrentDevice`), `POST /auth/logout`, `GET/DELETE /auth/devices`,
      revoked devices published in the shared Redis (db 2) for chat-service. Deployed 2026-11-02.
 7. Observability, in two parts:
-   - 🔨 7a: tracing (OpenTelemetry → Alloy → Tempo), `trace_id` on log lines.
-   - 7b: metrics (`/metrics` for Prometheus).
+   - ✅ 7a: tracing (OpenTelemetry → Alloy → Tempo), `trace_id` on log lines. Deployed 2026-11-04.
+   - 🔨 7b: metrics (`/metrics` for Prometheus).
 8. Dummy Expo app against it (PLAN.md phase 8).
 9. ✅ Real SMS provider: done as part of step 3 (Global SMS, per-provider settings in `config.py`).
 10. Linking devices by QR (after step 6): `device_links`, `POST /auth/link/start` + `/link/approve`, up to 4
