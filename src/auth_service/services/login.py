@@ -2,6 +2,7 @@
 
     otp/verify {phone, code, device}
       wrong code             -> InvalidCode (attempt counted)
+      5th wrong try or later -> TooManyAttempts (a new code must be requested)
       right code, known user -> LoggedIn (this phone replaces the primary device + access and
                                 refresh tokens)
       right code, new phone  -> RegistrationRequired (services/registration.py takes over)
@@ -45,8 +46,12 @@ class InvalidCode(Exception):
         self.attempts_left = attempts_left
 
 
+class TooManyAttempts(Exception):
+    """The code got MAX_ATTEMPTS wrong tries: it is burnt, even the right code won't work now."""
+
+
 class CodeExpired(Exception):
-    """No usable code: none sent, expired, already used, or too many wrong tries."""
+    """No usable code: none sent, expired or already used."""
 
 
 async def verify_code(
@@ -68,16 +73,16 @@ async def verify_code(
 
     # Only the newest code counts: requesting a new one cancels the previous code.
     challenge = await repos.latest_otp_challenge_for_update(session, phone)
-    if (
-        challenge is None
-        or challenge.consumed_at is not None
-        or challenge.expires_at <= now
-        or challenge.attempts >= MAX_ATTEMPTS
-    ):
+    if challenge is None or challenge.consumed_at is not None or challenge.expires_at <= now:
         await session.rollback()
         log.info("otp code expired", extra={"phone": masked})
         LOGINS.labels("code_expired").inc()
         raise CodeExpired
+    if challenge.attempts >= MAX_ATTEMPTS:
+        await session.rollback()
+        log.info("otp too many attempts", extra={"phone": masked})
+        LOGINS.labels("too_many_attempts").inc()
+        raise TooManyAttempts
 
     # compare_digest takes the same time wherever the bytes differ, so response timing can't
     # leak how much of the hash matched.
@@ -88,7 +93,7 @@ async def verify_code(
         log.warning("otp wrong code", extra={"phone": masked, "attempts_left": attempts_left})
         LOGINS.labels("invalid_code").inc()
         if attempts_left == 0:
-            raise CodeExpired  # nothing left to retry: tell the app to request a new code now
+            raise TooManyAttempts  # nothing left to retry: tell the app to request a new code
         raise InvalidCode(attempts_left)
 
     challenge.consumed_at = now  # single use

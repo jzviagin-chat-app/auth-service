@@ -267,7 +267,8 @@ Example queries: `sum by (route) (rate(http_requests_total{app="auth"}[5m]))`,
 - **Sign up (new number, Telegram-like):** the same `otp/verify` answers `registration_required` with a
   registration token (random 256 bits, only its SHA-256 stored on the `otp_challenges` row, 10 min, single
   use) → `register {registration_token, display_name, device}` → user + device → `logged_in`. No user row
-  exists before a display name is sent. The app keeps the registration token in memory only.
+  exists before a display name is sent. The app keeps the registration token only in secure storage
+  (this device only) and deletes it on use, expiry, back or sign-in, so a restart doesn't cost a new SMS.
 - **Refresh (`services/refresh.py`):** `token/refresh {refresh_token}` → a new access token and a new
   refresh token. Every login creates a new device, so **the device is the chain**: no family ids, and
   "kill the chain" = sign the device out (`devices.revoked_at`). Each refresh locks the device row, so
@@ -346,17 +347,18 @@ and mobile apps don't handle cookies well. Why not one long-lived JWT: it can't 
 | GET | `/auth/docs` | – | Interactive API docs, **dev only** |
 
 Errors use one shape everywhere: `{"error": "<code>", "message": "<human text>"}`. Clients branch on
-`error`, never on `message`. Codes so far: `invalid_request` (422, malformed body; names the fields,
+`error`, never on `message`. Some errors add machine-readable fields (counts, seconds, fixed names; never
+a phone number, code or token), listed with each answer below. Codes so far: `invalid_request` (422, malformed body; names the fields,
 never echoes values), `not_found`, `method_not_allowed`, `internal_error` (500), and the ones below.
 
 **`POST /auth/otp/request`** `{"phone": "+972501234567"}`
 
 | Answer | When |
 |---|---|
-| `202 {"resend_after_seconds": 60, "expires_in_seconds": 300}` | Code sent |
+| `202 {"resend_after_seconds": 60, "expires_in_seconds": 300}` | Code sent. `resend_after_seconds`: when the next code may be requested: the 60 s cooldown, or longer when this code was the last one of an hour or day (number or IP) |
 | `400 invalid_phone` | Not an Israeli mobile number in E.164 form (`+9725XXXXXXXX`) |
-| `429 rate_limited` + `Retry-After: <seconds>` | 60 s resend cooldown; max 5/hour and 10/day per phone; max 30/hour and 200/day per IP |
-| `503 sms_unavailable` | Global daily SMS cap reached, Redis unreachable (fail closed), SMS provider failed, or not configured |
+| `429 {"error": "rate_limited", "message", "limit", "retry_after_seconds"}` + `Retry-After: <seconds>` | A limit is full. `limit`: `resend_cooldown` (60 s between codes), `phone_hour` / `phone_day` (5 / 10 per number), `ip_hour` / `ip_day` (30 / 200 per client IP). A number's limits block only that number; an IP limit blocks every number from that IP. If several are full (the cooldown included), the one that frees up last, so the wait is the real one |
+| `503 sms_unavailable` | Global daily SMS cap reached (+ `Retry-After`: seconds until midnight UTC), Redis unreachable (fail closed), SMS provider failed, or not configured |
 
 The limits apply to registered and unknown numbers alike, and the endpoint never reads `users`, so no
 answer reveals whether a number has an account.
@@ -364,7 +366,11 @@ answer reveals whether a number has an account.
 Flow (`api/otp.py` → `services/otp.py`):
 1. Validate the number (Israel-only is an SMS cost guard).
 2. Redis limits (`services/rate_limit.py`): keys `auth:rl:phone:<HMAC of phone>:cooldown|h|d` and
-   `auth:rl:ip:<ip>:h|d`, counted with `INCR` + `EXPIRE NX` in `MULTI/EXEC` transactions. The phone is an
+   `auth:rl:ip:<ip>:h|d`. One Lua script (Redis runs it as one step, so two pods can't both take the last
+   slot) checks the cooldown and the 4 windows, and only when none is full starts the cooldown and counts
+   the request (`INCR` + `EXPIRE NX`). A refused request changes nothing, so tapping while blocked doesn't
+   use up the quota. Neither does a request that the global daily SMS cap refuses right after (step 3):
+   its count is taken back (a failed send stays counted: the SMS may have gone out anyway). Each window starts at its first request and is deleted when it ends. The phone is an
    HMAC in the key, so no phone numbers sit in Redis.
 3. Daily cap (`sms_daily_usage`, atomic `UPDATE … WHERE sent < cap`) and the `otp_challenges` row, in one
    transaction.
@@ -377,8 +383,9 @@ Flow (`api/otp.py` → `services/otp.py`):
 |---|---|
 | `200 {"status": "logged_in", "access_token", "token_type": "Bearer", "expires_in": 900, "refresh_token"}` (the user and device ids are in the access token: `sub`, `did`) | Right code, the number has an account: this phone becomes the primary device, the previous one is signed out |
 | `200 {"status": "registration_required", "registration_token", "expires_in": 600}` | Right code, new number → call `register` |
-| `400 invalid_code` | Wrong code; retry (the message says how many tries are left) |
-| `400 code_expired` | No usable code: none sent, expired, already used, or the 5th wrong try → request a new one |
+| `400 invalid_code` + `attempts_left` (1–4), `resend_after_seconds` | Wrong code; retry |
+| `400 too_many_attempts` + `resend_after_seconds` | The 5th wrong try, and any try after it (even the right code) → request a new one |
+| `400 code_expired` + `resend_after_seconds` | No usable code: none sent, expired or already used → request a new one |
 | `400 invalid_phone` / `422 invalid_request` | Bad number / malformed body (the code must be 6 digits) |
 | `400 unsupported_platform` | `platform` is `web`: SMS login is for phones only (nothing is used up) |
 | `403 account_blocked` | The user's status is `blocked` (the code is used up) |
@@ -388,6 +395,9 @@ Flow (`api/otp.py` → `services/otp.py`):
 Only the **newest** code for a number counts: a resend cancels the previous one. The challenge row is locked
 (`SELECT … FOR UPDATE`), so parallel requests can't use one code twice or skip the attempt count. Guessing is
 bounded by 5 tries per code × 10 codes a day per number (the `otp/request` limits).
+`resend_after_seconds` is what's left of the number's resend cooldown (`0`: a new code can be requested now;
+the hourly/daily limits show up only in `otp/request`'s 429). It is only read, nothing is counted, and it is
+left out when Redis is unreachable (the app counts down on its own).
 
 **`POST /auth/register`** `{"registration_token": "...", "display_name": "Jacob", "device": {...}}`
 (`display_name` trimmed, 1–50 characters)

@@ -9,10 +9,11 @@ import hashlib
 import hmac
 import ipaddress
 import logging
+import math
 import re
 import secrets
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +27,8 @@ from auth_service.services.rate_limit import (
     LimitsUnavailable,
     RateLimited,
     check_and_count,
+    cooldown_left,
+    uncount,
 )
 from auth_service.services.sms import SmsSender, SmsSendError
 
@@ -62,11 +65,13 @@ class InvalidPhone(Exception):
 
 
 class SmsUnavailable(Exception):
-    """We won't send a code now (daily cap, Redis down, provider failure). `reason`: for logs."""
+    """We won't send a code now (daily cap, Redis down, provider failure). `reason`: for logs.
+    `retry_after`: seconds until it can work again, when we know (only the daily cap)."""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, retry_after: int | None = None) -> None:
         super().__init__(reason)
         self.reason = reason
+        self.retry_after = retry_after
 
 
 # ---- small pure helpers (unit-tested) ----
@@ -105,6 +110,12 @@ def clean_ip(ip: str | None) -> str | None:
         return None
 
 
+def seconds_to_next_utc_day(now: datetime) -> int:
+    """When the daily SMS cap resets (sms_daily_usage counts per UTC day)."""
+    tomorrow = datetime.combine(now.date() + timedelta(days=1), time(), tzinfo=UTC)
+    return max(math.ceil((tomorrow - now).total_seconds()), 1)
+
+
 def sms_text(code: str, ttl: timedelta) -> str:
     # Placeholder wording until the provider and message template are chosen.
     return (
@@ -125,8 +136,10 @@ async def request_code(
     pepper: bytes,
     policy: OtpPolicy,
     now: datetime,
-) -> None:
-    """Send a new code to `phone`, or raise InvalidPhone / RateLimited / SmsUnavailable."""
+) -> int:
+    """Send a new code to `phone`, or raise InvalidPhone / RateLimited / SmsUnavailable.
+    Returns the seconds until the next code may be requested (the cooldown, or longer when this
+    code used the last one of an hour or day)."""
     if not is_israeli_mobile(phone):
         OTP_REQUESTS.labels("invalid_phone").inc()
         raise InvalidPhone
@@ -136,7 +149,8 @@ async def request_code(
 
     # 1. Per-phone / per-IP limits (Redis).
     try:
-        await check_and_count(redis, policy.limits, phone_ref(pepper, phone), ip or "unknown")
+        ref = phone_ref(pepper, phone)
+        resend_after = await check_and_count(redis, policy.limits, ref, ip or "unknown")
     except RateLimited as e:
         log.warning("otp rate limited", extra={"phone": masked, "ip": ip, "limit": e.limit})
         OTP_REQUESTS.labels(f"rate_limited_{e.limit}").inc()
@@ -151,7 +165,8 @@ async def request_code(
         await session.rollback()
         log.error("sms daily cap reached", extra={"cap": policy.daily_cap})
         OTP_REQUESTS.labels("daily_cap").inc()
-        raise SmsUnavailable("daily_cap")
+        await uncount(redis, policy.limits, ref, ip or "unknown")  # nothing sent: count nothing
+        raise SmsUnavailable("daily_cap", seconds_to_next_utc_day(now))
     code = new_code()
     await repos.insert_otp_challenge(
         session,
@@ -175,3 +190,12 @@ async def request_code(
     log.info("sms sent", extra={"phone": masked, "provider": sms.name, "message_id": message_id})
     SMS_SENT.labels(sms.name, "ok").inc()
     OTP_REQUESTS.labels("sent").inc()
+    return resend_after
+
+
+async def resend_after(redis: Redis | None, pepper: bytes, phone: str) -> int | None:
+    """Seconds until `phone` may request a new code (the resend cooldown; 0: now), for the code
+    step's errors. Only reads, counts nothing. None without Redis: the app counts down itself."""
+    if redis is None:
+        return None
+    return await cooldown_left(redis, phone_ref(pepper, phone))

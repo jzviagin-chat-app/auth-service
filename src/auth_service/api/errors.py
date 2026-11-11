@@ -1,7 +1,11 @@
 """One error shape for every response: {"error": "<machine_code>", "message": "<human text>"}.
 
-Clients branch on `error`, never on `message` (README, "API"). FastAPI's own errors look different
-({"detail": ...}), so the handlers below convert them. Like an Express error-handling middleware.
+Clients branch on `error`, never on `message` (README, "API"). Some errors add machine-readable
+fields next to them (e.g. `attempts_left`, `retry_after_seconds`; each one is in the README): only
+counts, seconds and fixed names, never a phone number, code or token.
+
+FastAPI's own errors look different ({"detail": ...}), so the handlers below convert them. Like an
+Express error-handling middleware.
 """
 
 from collections.abc import Mapping
@@ -27,24 +31,35 @@ class ApiError(Exception):
     """Raise from a route to answer with our error shape: ApiError(400, "invalid_phone", "...")."""
 
     def __init__(
-        self, status_code: int, error: str, message: str, headers: dict[str, str] | None = None
+        self,
+        status_code: int,
+        error: str,
+        message: str,
+        headers: dict[str, str] | None = None,
+        extra: dict[str, int | str] | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.error = error
         self.message = message
         self.headers = headers
+        self.extra = extra  # more fields in the body, after error and message
 
 
 def error_response(
-    status_code: int, error: str, message: str, headers: Mapping[str, str] | None = None
+    status_code: int,
+    error: str,
+    message: str,
+    headers: Mapping[str, str] | None = None,
+    extra: Mapping[str, int | str] | None = None,
 ) -> JSONResponse:
-    return JSONResponse({"error": error, "message": message}, status_code, headers=headers)
+    body = {"error": error, "message": message, **(extra or {})}
+    return JSONResponse(body, status_code, headers=headers)
 
 
 async def _api_error(_: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, ApiError)  # noqa: S101 (registered for ApiError only)
-    return error_response(exc.status_code, exc.error, exc.message, exc.headers)
+    return error_response(exc.status_code, exc.error, exc.message, exc.headers, exc.extra)
 
 
 async def _http_error(_: Request, exc: Exception) -> JSONResponse:

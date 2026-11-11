@@ -117,9 +117,10 @@ class LoginContext:
     refresh: RefreshPolicy
     revoked: RevokedDevices
     pepper: bytes
+    redis: Redis | None  # only to tell the app when it may resend; login works without it
 
 
-def get_login_context(ctx: SessionContextDep) -> LoginContext:
+def get_login_context(request: Request, ctx: SessionContextDep) -> LoginContext:
     """Also 503 (no code is used up) without the OTP_PEPPER to check codes with."""
     settings = get_settings()
     if settings.otp_pepper is None:
@@ -129,6 +130,7 @@ def get_login_context(ctx: SessionContextDep) -> LoginContext:
         refresh=ctx.refresh,
         revoked=ctx.revoked,
         pepper=settings.otp_pepper.get_secret_value().encode(),
+        redis=getattr(request.app.state, "redis", None),
     )
 
 
