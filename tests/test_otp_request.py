@@ -255,6 +255,9 @@ async def test_daily_cap(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None:
     assert r["json"]["error"] == "sms_unavailable"
     assert 1 <= int(r["retry_after"]) <= 86400  # until the next UTC day
     assert await sms_sent_today(app) == 1  # never over the cap
+    # The refused phone's limits are as if it never asked (no cooldown, nothing counted), and the
+    # IP's windows hold only the code that was sent.
+    assert sorted((await limit_counters(app)).values()) == ["1"] * 5
     assert len(await challenges(app)) == 1
     assert len(app.state.sms.sent) == 1
 

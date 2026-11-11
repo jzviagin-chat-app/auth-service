@@ -28,6 +28,7 @@ from auth_service.services.rate_limit import (
     RateLimited,
     check_and_count,
     cooldown_left,
+    uncount,
 )
 from auth_service.services.sms import SmsSender, SmsSendError
 
@@ -148,9 +149,8 @@ async def request_code(
 
     # 1. Per-phone / per-IP limits (Redis).
     try:
-        resend_after = await check_and_count(
-            redis, policy.limits, phone_ref(pepper, phone), ip or "unknown"
-        )
+        ref = phone_ref(pepper, phone)
+        resend_after = await check_and_count(redis, policy.limits, ref, ip or "unknown")
     except RateLimited as e:
         log.warning("otp rate limited", extra={"phone": masked, "ip": ip, "limit": e.limit})
         OTP_REQUESTS.labels(f"rate_limited_{e.limit}").inc()
@@ -165,6 +165,7 @@ async def request_code(
         await session.rollback()
         log.error("sms daily cap reached", extra={"cap": policy.daily_cap})
         OTP_REQUESTS.labels("daily_cap").inc()
+        await uncount(redis, policy.limits, ref, ip or "unknown")  # nothing sent: count nothing
         raise SmsUnavailable("daily_cap", seconds_to_next_utc_day(now))
     code = new_code()
     await repos.insert_otp_challenge(

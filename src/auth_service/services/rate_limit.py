@@ -102,18 +102,36 @@ return {-1, next_ok}
 """
 
 
+# Takes back what _CHECK_AND_COUNT counted for a request that then sent nothing (same KEYS):
+# the cooldown goes, and each window goes down by 1 (a window back at 0 is deleted).
+_UNCOUNT = """
+redis.call('DEL', KEYS[1])
+for j = 2, #KEYS do
+  if redis.call('EXISTS', KEYS[j]) == 1 and redis.call('DECR', KEYS[j]) <= 0 then
+    redis.call('DEL', KEYS[j])
+  end
+end
+return 0
+"""
+
+
 def _cooldown_key(phone_ref: str) -> str:
     return f"auth:rl:phone:{phone_ref}:cooldown"
 
 
-async def _check_and_count(redis: Redis, limits: Limits, phone_ref: str, ip: str) -> int:
+def _windows(limits: Limits, phone_ref: str, ip: str) -> list[tuple[str, str, int, int]]:
+    """(name, key, seconds, maximum) of the 4 windows."""
     phone_key = f"auth:rl:phone:{phone_ref}"
-    windows = [
+    return [
         ("phone_hour", f"{phone_key}:h", HOUR, limits.phone_per_hour),
         ("phone_day", f"{phone_key}:d", DAY, limits.phone_per_day),
         ("ip_hour", f"auth:rl:ip:{ip}:h", HOUR, limits.ip_per_hour),
         ("ip_day", f"auth:rl:ip:{ip}:d", DAY, limits.ip_per_day),
     ]
+
+
+async def _check_and_count(redis: Redis, limits: Limits, phone_ref: str, ip: str) -> int:
+    windows = _windows(limits, phone_ref, ip)
     args: list[int] = [limits.cooldown_seconds]
     for _, _, seconds, maximum in windows:
         args += [seconds, maximum]
@@ -126,6 +144,18 @@ async def _check_and_count(redis: Redis, limits: Limits, phone_ref: str, ip: str
     if blocker > 0:
         raise RateLimited(windows[blocker - 1][0], int(wait))
     return int(wait)  # allowed: when the next code may be requested
+
+
+async def uncount(redis: Redis, limits: Limits, phone_ref: str, ip: str) -> None:
+    """Take back a counted request that sent nothing because the global daily SMS cap was full,
+    so a day with the cap reached doesn't use up anyone's own limits. Not for a failed send: the
+    SMS may have gone out anyway (a timeout), so that one stays counted. A Redis error is only
+    logged: the request is refused either way."""
+    keys = [_cooldown_key(phone_ref), *(key for _, key, _, _ in _windows(limits, phone_ref, ip))]
+    try:
+        await redis.register_script(_UNCOUNT)(keys=keys)
+    except RedisError as e:
+        log.warning("rate limit uncount failed", extra={"error_type": type(e).__name__})
 
 
 async def cooldown_left(redis: Redis, phone_ref: str) -> int | None:

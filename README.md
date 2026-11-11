@@ -369,7 +369,8 @@ Flow (`api/otp.py` → `services/otp.py`):
    `auth:rl:ip:<ip>:h|d`. One Lua script (Redis runs it as one step, so two pods can't both take the last
    slot) checks the cooldown and the 4 windows, and only when none is full starts the cooldown and counts
    the request (`INCR` + `EXPIRE NX`). A refused request changes nothing, so tapping while blocked doesn't
-   use up the quota. Each window starts at its first request and is deleted when it ends. The phone is an
+   use up the quota. Neither does a request that the global daily SMS cap refuses right after (step 3):
+   its count is taken back (a failed send stays counted: the SMS may have gone out anyway). Each window starts at its first request and is deleted when it ends. The phone is an
    HMAC in the key, so no phone numbers sit in Redis.
 3. Daily cap (`sms_daily_usage`, atomic `UPDATE … WHERE sent < cap`) and the `otp_challenges` row, in one
    transaction.
