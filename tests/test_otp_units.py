@@ -1,11 +1,19 @@
 """Small pure functions of the OTP flow (no database, no Redis)."""
 
 import re
+from datetime import UTC, datetime
 
 import pytest
 
 from auth_service.core.masking import mask_phone
-from auth_service.services.otp import clean_ip, hash_code, is_israeli_mobile, new_code, phone_ref
+from auth_service.services.otp import (
+    clean_ip,
+    hash_code,
+    is_israeli_mobile,
+    new_code,
+    phone_ref,
+    seconds_to_next_utc_day,
+)
 
 PEPPER = b"test-pepper"
 
@@ -64,3 +72,9 @@ def test_clean_ip() -> None:
     assert clean_ip("2001:db8::1") == "2001:db8::1"
     assert clean_ip("testclient") is None
     assert clean_ip(None) is None
+
+
+def test_seconds_to_next_utc_day() -> None:
+    assert seconds_to_next_utc_day(datetime(2026, 11, 11, 23, 59, 30, tzinfo=UTC)) == 30
+    assert seconds_to_next_utc_day(datetime(2026, 11, 11, 0, 0, tzinfo=UTC)) == 86400
+    assert seconds_to_next_utc_day(datetime(2026, 11, 11, 23, 59, 59, 900000, tzinfo=UTC)) == 1

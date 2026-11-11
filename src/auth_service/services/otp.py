@@ -9,10 +9,11 @@ import hashlib
 import hmac
 import ipaddress
 import logging
+import math
 import re
 import secrets
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,6 +27,7 @@ from auth_service.services.rate_limit import (
     LimitsUnavailable,
     RateLimited,
     check_and_count,
+    cooldown_left,
 )
 from auth_service.services.sms import SmsSender, SmsSendError
 
@@ -62,11 +64,13 @@ class InvalidPhone(Exception):
 
 
 class SmsUnavailable(Exception):
-    """We won't send a code now (daily cap, Redis down, provider failure). `reason`: for logs."""
+    """We won't send a code now (daily cap, Redis down, provider failure). `reason`: for logs.
+    `retry_after`: seconds until it can work again, when we know (only the daily cap)."""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, retry_after: int | None = None) -> None:
         super().__init__(reason)
         self.reason = reason
+        self.retry_after = retry_after
 
 
 # ---- small pure helpers (unit-tested) ----
@@ -103,6 +107,12 @@ def clean_ip(ip: str | None) -> str | None:
         return str(ipaddress.ip_address(ip))
     except ValueError:
         return None
+
+
+def seconds_to_next_utc_day(now: datetime) -> int:
+    """When the daily SMS cap resets (sms_daily_usage counts per UTC day)."""
+    tomorrow = datetime.combine(now.date() + timedelta(days=1), time(), tzinfo=UTC)
+    return max(math.ceil((tomorrow - now).total_seconds()), 1)
 
 
 def sms_text(code: str, ttl: timedelta) -> str:
@@ -151,7 +161,7 @@ async def request_code(
         await session.rollback()
         log.error("sms daily cap reached", extra={"cap": policy.daily_cap})
         OTP_REQUESTS.labels("daily_cap").inc()
-        raise SmsUnavailable("daily_cap")
+        raise SmsUnavailable("daily_cap", seconds_to_next_utc_day(now))
     code = new_code()
     await repos.insert_otp_challenge(
         session,
@@ -175,3 +185,11 @@ async def request_code(
     log.info("sms sent", extra={"phone": masked, "provider": sms.name, "message_id": message_id})
     SMS_SENT.labels(sms.name, "ok").inc()
     OTP_REQUESTS.labels("sent").inc()
+
+
+async def resend_after(redis: Redis | None, pepper: bytes, phone: str) -> int | None:
+    """Seconds until `phone` may request a new code (the resend cooldown; 0: now), for the code
+    step's errors. Only reads, counts nothing. None without Redis: the app counts down itself."""
+    if redis is None:
+        return None
+    return await cooldown_left(redis, phone_ref(pepper, phone))

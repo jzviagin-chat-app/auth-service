@@ -1,12 +1,18 @@
 """Per-phone and per-IP limits for sending codes, counted in Redis (PLAN.md, decided 2026-10-21).
 
 Fixed windows: each counter is a Redis key that INCR creates and that expires after its window
-(EXPIRE ... NX sets the expiry only when the key is new). Every group of commands runs as one
-MULTI/EXEC transaction, so two pods can't interleave between "count" and "set expiry".
-Like `rate-limiter-flexible` on ioredis in Node, written out by hand.
+(EXPIRE ... NX sets the expiry only when the key is new), so it starts at the first request and is
+deleted as a whole when the window ends. Like `rate-limiter-flexible` on ioredis in Node, written
+out by hand.
+
+Check first, count only what is sent (decided 2026-11-11): one Lua script checks the cooldown and
+every window, and only if nothing is full starts the cooldown and counts the request everywhere.
+A refused request changes nothing, so tapping "resend" while blocked can't use up the quota.
+Redis runs a script as one step (nothing else in between), so two pods can't both take the
+last slot (like a database transaction).
 
 Keys (Redis db 1 is auth's; all keys start with "auth:rl:"):
-  auth:rl:phone:<phone hmac>:cooldown   one code per phone per cooldown (SET NX EX)
+  auth:rl:phone:<phone hmac>:cooldown   one code per phone per cooldown
   auth:rl:phone:<phone hmac>:h / :d     codes per phone per hour / day
   auth:rl:ip:<ip>:h / :d                codes per client IP per hour / day
 
@@ -40,7 +46,7 @@ class Limits:
 class RateLimited(Exception):
     def __init__(self, limit: str, retry_after: int) -> None:
         super().__init__(limit)
-        self.limit = limit  # which limit, e.g. "phone_hour" (for logs)
+        self.limit = limit  # resend_cooldown, phone_hour, phone_day, ip_hour or ip_day (public)
         self.retry_after = retry_after  # seconds until it resets (Retry-After header)
 
 
@@ -56,39 +62,68 @@ async def check_and_count(redis: Redis, limits: Limits, phone_ref: str, ip: str)
         raise LimitsUnavailable(type(e).__name__) from e
 
 
+# KEYS[1] = the cooldown key, KEYS[2..5] = the windows. ARGV[1] = cooldown seconds, then for
+# window j (1..4): ARGV[2j] = its length in seconds, ARGV[2j+1] = its maximum.
+# Returns {-1, 0} when allowed (and counted), {0, wait} for the cooldown, {j, wait} for window j.
+# A Redis Cluster would need every key on one node (a shared {hash tag} in the key names).
+_CHECK_AND_COUNT = """
+local cooldown = redis.call('TTL', KEYS[1])
+if cooldown ~= -2 then
+  return {0, math.max(cooldown, 1)}
+end
+local blocker, wait = -1, 0
+for j = 1, #KEYS - 1 do
+  local key, seconds = KEYS[j + 1], tonumber(ARGV[2 * j])
+  local count = tonumber(redis.call('GET', key) or '0')
+  if count >= tonumber(ARGV[2 * j + 1]) then
+    local ttl = redis.call('TTL', key)
+    if ttl < 1 then ttl = seconds end
+    if ttl > wait then blocker, wait = j, ttl end
+  end
+end
+if blocker ~= -1 then
+  return {blocker, wait}
+end
+redis.call('SET', KEYS[1], 1, 'EX', ARGV[1])
+for j = 1, #KEYS - 1 do
+  redis.call('INCR', KEYS[j + 1])
+  redis.call('EXPIRE', KEYS[j + 1], ARGV[2 * j], 'NX')
+end
+return {-1, 0}
+"""
+
+
+def _cooldown_key(phone_ref: str) -> str:
+    return f"auth:rl:phone:{phone_ref}:cooldown"
+
+
 async def _check_and_count(redis: Redis, limits: Limits, phone_ref: str, ip: str) -> None:
     phone_key = f"auth:rl:phone:{phone_ref}"
-
-    # 1. Cooldown first, on its own: a quick "resend" tap doesn't use up the hourly/daily quota.
-    #    It starts even if step 2 then rejects the request, on purpose: retries during that minute
-    #    stop here, so hammering the button can't keep counting against the phone's or IP's limits.
-    async with redis.pipeline(transaction=True) as pipe:
-        pipe.set(f"{phone_key}:cooldown", 1, nx=True, ex=limits.cooldown_seconds)
-        pipe.ttl(f"{phone_key}:cooldown")
-        was_set, ttl = await pipe.execute()
-    if not was_set:
-        raise RateLimited("phone_cooldown", max(int(ttl), 1))
-
-    # 2. Count this request in every window, then see whether any went over.
     windows = [
         ("phone_hour", f"{phone_key}:h", HOUR, limits.phone_per_hour),
         ("phone_day", f"{phone_key}:d", DAY, limits.phone_per_day),
         ("ip_hour", f"auth:rl:ip:{ip}:h", HOUR, limits.ip_per_hour),
         ("ip_day", f"auth:rl:ip:{ip}:d", DAY, limits.ip_per_day),
     ]
-    async with redis.pipeline(transaction=True) as pipe:
-        for _, key, seconds, _ in windows:
-            pipe.incr(key)
-            pipe.expire(key, seconds, nx=True)
-            pipe.ttl(key)
-        results = await pipe.execute()
+    args: list[int] = [limits.cooldown_seconds]
+    for _, _, seconds, maximum in windows:
+        args += [seconds, maximum]
+    script = redis.register_script(_CHECK_AND_COUNT)  # sent by its hash; the text only once
+    blocker, wait = await script(
+        keys=[_cooldown_key(phone_ref), *(key for _, key, _, _ in windows)], args=args
+    )
+    if blocker == 0:
+        raise RateLimited("resend_cooldown", int(wait))
+    if blocker > 0:
+        # The window that resets last, otherwise the next try fails again.
+        raise RateLimited(windows[blocker - 1][0], int(wait))
 
-    exceeded = []
-    for i, (name, _, seconds, maximum) in enumerate(windows):
-        count, _, ttl = results[i * 3 : i * 3 + 3]
-        if int(count) > maximum:
-            exceeded.append((name, int(ttl) if int(ttl) > 0 else seconds))
-    if exceeded:
-        # Wait for the window that resets last, otherwise the next try fails again.
-        name, retry_after = max(exceeded, key=lambda x: x[1])
-        raise RateLimited(name, retry_after)
+
+async def cooldown_left(redis: Redis, phone_ref: str) -> int | None:
+    """Seconds until this phone may request a new code (0: now). Only reads; None if Redis fails."""
+    try:
+        ttl = int(await redis.ttl(_cooldown_key(phone_ref)))
+    except RedisError as e:
+        log.warning("cooldown unreadable", extra={"error_type": type(e).__name__})
+        return None
+    return max(ttl, 0)  # -2: no key (over), -1: no expiry (never set by us)

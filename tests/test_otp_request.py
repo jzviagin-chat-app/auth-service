@@ -173,7 +173,9 @@ async def test_resend_cooldown(app: FastAPI) -> None:
     status, r = await request_code(app)
     assert status == 429
     assert r["json"]["error"] == "rate_limited"
+    assert r["json"]["limit"] == "resend_cooldown"
     assert 1 <= int(r["retry_after"]) <= 60
+    assert r["json"]["retry_after_seconds"] == int(r["retry_after"])
     assert len(app.state.sms.sent) == 1
 
 
@@ -184,7 +186,9 @@ async def test_phone_hourly_limit(app: FastAPI, monkeypatch: pytest.MonkeyPatch)
         await end_cooldown(app)
     status, r = await request_code(app)
     assert status == 429
+    assert r["json"]["limit"] == "phone_hour"
     assert 60 < int(r["retry_after"]) <= 3600  # wait for the hour window, not the cooldown
+    assert r["json"]["retry_after_seconds"] == int(r["retry_after"])
     assert len(app.state.sms.sent) == 2
 
 
@@ -192,9 +196,39 @@ async def test_ip_hourly_limit(app: FastAPI, monkeypatch: pytest.MonkeyPatch) ->
     set_setting(monkeypatch, "OTP_IP_MAX_PER_HOUR", "2")
     assert (await request_code(app, "+972501111111"))[0] == 202
     assert (await request_code(app, "+972502222222"))[0] == 202
-    assert (await request_code(app, "+972503333333"))[0] == 429  # same IP, third phone
-    await end_cooldown(app)  # the rejected request still started this phone's cooldown
-    assert (await request_code(app, "+972503333333", ip="198.51.100.1"))[0] == 202  # other IP
+    status, r = await request_code(app, "+972503333333")  # same IP, third phone
+    assert (status, r["json"]["limit"]) == (429, "ip_hour")
+    # The refused request didn't start that phone's cooldown: right away from another IP it works.
+    assert (await request_code(app, "+972503333333", ip="198.51.100.1"))[0] == 202
+
+
+async def limit_counters(app: FastAPI) -> dict[str, str]:
+    redis: Redis = app.state.redis
+    return {k.decode(): (await redis.get(k)).decode() for k in await redis.keys("auth:rl:*")}
+
+
+async def test_a_refused_request_changes_nothing(app: FastAPI) -> None:
+    assert (await request_code(app))[0] == 202
+    before = await limit_counters(app)
+    assert sorted(v for v in before.values()) == ["1"] * 5  # cooldown + 4 windows
+    for _ in range(3):
+        assert (await request_code(app))[0] == 429  # the cooldown
+    assert await limit_counters(app) == before
+
+
+async def test_tapping_while_blocked_keeps_the_daily_quota(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    set_setting(monkeypatch, "OTP_PHONE_MAX_PER_HOUR", "5")
+    for _ in range(5):
+        assert (await request_code(app))[0] == 202
+        await end_cooldown(app)
+    for _ in range(3):  # the 6th request in the hour, tapped again and again
+        status, r = await request_code(app)
+        assert (status, r["json"]["limit"]) == (429, "phone_hour")
+    [day] = await app.state.redis.keys("auth:rl:phone:*:d")
+    assert await app.state.redis.get(day) == b"5"  # only what was sent
+    assert len(app.state.sms.sent) == 5
 
 
 async def test_daily_cap(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -203,6 +237,7 @@ async def test_daily_cap(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None:
     status, r = await request_code(app, "+972502222222")
     assert status == 503
     assert r["json"]["error"] == "sms_unavailable"
+    assert 1 <= int(r["retry_after"]) <= 86400  # until the next UTC day
     assert await sms_sent_today(app) == 1  # never over the cap
     assert len(await challenges(app)) == 1
     assert len(app.state.sms.sent) == 1
@@ -221,6 +256,7 @@ async def test_redis_down_fails_closed(app: FastAPI) -> None:
         app.state.redis = working
     assert status == 503
     assert r["json"]["error"] == "sms_unavailable"
+    assert r["retry_after"] is None  # no meaningful wait
     assert app.state.sms.sent == []
     assert await challenges(app) == []
 

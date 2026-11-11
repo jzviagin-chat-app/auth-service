@@ -10,7 +10,7 @@ from typing import Literal
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
-from auth_service.api.deps import DbSession, LoginContextDep, OtpContextDep
+from auth_service.api.deps import DbSession, LoginContext, LoginContextDep, OtpContextDep
 from auth_service.api.errors import ApiError
 from auth_service.api.schemas import DeviceIn, LoggedInOut
 from auth_service.services import devices, login, otp, registration
@@ -34,8 +34,11 @@ class OtpRequestOut(BaseModel):
     status_code=202,
     responses={
         400: {"description": "invalid_phone"},
-        429: {"description": "rate_limited (see Retry-After)"},
-        503: {"description": "sms_unavailable"},
+        429: {
+            "description": "rate_limited: `limit` (resend_cooldown, phone_hour, phone_day, "
+            "ip_hour, ip_day) and `retry_after_seconds` (also the Retry-After header)"
+        },
+        503: {"description": "sms_unavailable (Retry-After when the daily SMS cap is reached)"},
     },
 )
 async def request_otp(
@@ -63,9 +66,13 @@ async def request_otp(
             "rate_limited",
             "Too many code requests; try again later",
             headers={"Retry-After": str(e.retry_after)},
+            extra={"limit": e.limit, "retry_after_seconds": e.retry_after},
         ) from e
     except otp.SmsUnavailable as e:
-        raise ApiError(503, "sms_unavailable", "Can't send codes right now; try again later") from e
+        headers = None if e.retry_after is None else {"Retry-After": str(e.retry_after)}
+        raise ApiError(
+            503, "sms_unavailable", "Can't send codes right now; try again later", headers=headers
+        ) from e
 
     return OtpRequestOut(
         resend_after_seconds=ctx.policy.limits.cooldown_seconds,
@@ -89,8 +96,9 @@ class RegistrationRequiredOut(BaseModel):
     "/verify",
     responses={
         400: {
-            "description": "invalid_phone, unsupported_platform, invalid_code (retry), "
-            "code_expired (request a new one)"
+            "description": "invalid_phone, unsupported_platform, invalid_code (retry; "
+            "`attempts_left`), too_many_attempts and code_expired (request a new one). The code "
+            "errors add `resend_after_seconds` (0: now) when it can be read"
         },
         403: {"description": "account_blocked"},
         409: {"description": "login_conflict (a parallel login; retry)"},
@@ -123,10 +131,26 @@ async def verify_otp(
             400, "unsupported_platform", "SMS login is for phones only (platform ios or android)"
         ) from e
     except login.InvalidCode as e:
-        raise ApiError(400, "invalid_code", f"Wrong code; {e.attempts_left} attempts left") from e
+        extra = await _resend_after(ctx, body.phone)
+        raise ApiError(
+            400,
+            "invalid_code",
+            f"Wrong code; {e.attempts_left} attempts left",
+            extra={"attempts_left": e.attempts_left, **extra},
+        ) from e
+    except login.TooManyAttempts as e:
+        raise ApiError(
+            400,
+            "too_many_attempts",
+            "Too many wrong tries for this code; request a new one",
+            extra=await _resend_after(ctx, body.phone),
+        ) from e
     except login.CodeExpired as e:
         raise ApiError(
-            400, "code_expired", "This code can't be used anymore; request a new one"
+            400,
+            "code_expired",
+            "This code can't be used anymore; request a new one",
+            extra=await _resend_after(ctx, body.phone),
         ) from e
     except devices.AccountBlocked as e:
         raise ApiError(403, "account_blocked", "This account is blocked") from e
@@ -140,3 +164,9 @@ async def verify_otp(
             registration_token=result.registration_token, expires_in=result.expires_in
         )
     return LoggedInOut.from_result(result)
+
+
+async def _resend_after(ctx: LoginContext, phone: str) -> dict[str, int | str]:
+    """{"resend_after_seconds": N} for the code-step errors, or {} if Redis can't tell."""
+    seconds = await otp.resend_after(ctx.redis, ctx.pepper, phone)
+    return {} if seconds is None else {"resend_after_seconds": seconds}

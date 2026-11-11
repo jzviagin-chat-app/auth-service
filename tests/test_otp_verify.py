@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from redis.asyncio import Redis
 from sqlalchemy import select, update
 
 from auth_service.core.logging import JsonFormatter
@@ -20,7 +21,7 @@ from auth_service.db import repos
 from auth_service.db.models import Device, OtpChallenge, User
 from auth_service.services import devices
 from auth_service.services.cleanup import delete_old_devices
-from auth_service.services.otp import hash_code
+from auth_service.services.otp import hash_code, phone_ref
 from auth_service.services.tokens import verify_access_token
 from tests.conftest import PEPPER, needs_db, needs_redis
 
@@ -321,6 +322,7 @@ async def test_wrong_code_counts_attempts(app: FastAPI) -> None:
     await add_code(app)
     status, body = await verify(app, "000000")
     assert (status, body["error"]) == (400, "invalid_code")
+    assert body["attempts_left"] == 4
     assert "4 attempts left" in body["message"]
     assert (await the_challenge(app)).attempts == 1
     assert (await verify(app))[0] == 200  # the right code still works
@@ -330,9 +332,51 @@ async def test_five_wrong_codes_burn_the_code(app: FastAPI) -> None:
     await add_code(app)
     for _ in range(4):
         assert (await verify(app, "000000"))[1]["error"] == "invalid_code"
-    assert (await verify(app, "000000"))[1]["error"] == "code_expired"  # 5th: nothing left
+    assert (await verify(app, "000000"))[1]["error"] == "too_many_attempts"  # 5th: nothing left
     status, body = await verify(app)  # even the right code
-    assert (status, body["error"]) == (400, "code_expired")
+    assert (status, body["error"]) == (400, "too_many_attempts")
+
+
+@needs_redis
+async def test_code_errors_tell_when_a_new_code_can_be_sent(app: FastAPI) -> None:
+    """resend_after_seconds = what's left of the resend cooldown (read-only), 0 when it's over."""
+    cooldown = f"auth:rl:phone:{phone_ref(PEPPER.encode(), PHONE)}:cooldown"
+    await app.state.redis.set(cooldown, 1, ex=42)
+    await add_code(app)
+    for _ in range(4):
+        _, body = await verify(app, "000000")
+        assert body["error"] == "invalid_code"
+        assert 1 <= body["resend_after_seconds"] <= 42
+    _, body = await verify(app, "000000")
+    assert body["error"] == "too_many_attempts"
+    assert 1 <= body["resend_after_seconds"] <= 42
+
+    await app.state.redis.delete(cooldown)
+    _, body = await verify(app)
+    assert body == {
+        "error": "too_many_attempts",
+        "message": "Too many wrong tries for this code; request a new one",
+        "resend_after_seconds": 0,
+    }
+    assert await app.state.redis.keys("auth:rl:*") == []  # nothing set or counted
+
+
+async def test_code_errors_without_redis_still_answer(app: FastAPI) -> None:
+    """Redis missing or unreachable: no resend_after_seconds, and verify works as usual."""
+    working = app.state.redis
+    try:
+        await add_code(app)
+        for redis in (None, Redis.from_url("redis://localhost:1/0", socket_connect_timeout=0.2)):
+            app.state.redis = redis
+            status, body = await verify(app, "000000")
+            assert (status, body["error"]) == (400, "invalid_code")
+            assert "resend_after_seconds" not in body
+            if redis is not None:
+                await redis.aclose()
+        app.state.redis = None
+        assert (await verify(app))[0] == 200
+    finally:
+        app.state.redis = working
 
 
 async def test_expired_code(app: FastAPI) -> None:

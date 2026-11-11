@@ -43,7 +43,8 @@ SMS_SENT = Counter(
 LOGINS = Counter(
     "auth_logins_total",
     "otp/verify and register by outcome (logged_in, registration_required, registered, "
-    "invalid_code, code_expired, blocked, already_registered, invalid_registration_token)",
+    "invalid_code, too_many_attempts, code_expired, blocked, already_registered, "
+    "invalid_registration_token)",
     ["outcome"],
 )
 REFRESHES = Counter(
