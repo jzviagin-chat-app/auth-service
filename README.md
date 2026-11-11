@@ -355,9 +355,9 @@ never echoes values), `not_found`, `method_not_allowed`, `internal_error` (500),
 
 | Answer | When |
 |---|---|
-| `202 {"resend_after_seconds": 60, "expires_in_seconds": 300}` | Code sent |
+| `202 {"resend_after_seconds": 60, "expires_in_seconds": 300}` | Code sent. `resend_after_seconds`: when the next code may be requested: the 60 s cooldown, or longer when this code was the last one of an hour or day (number or IP) |
 | `400 invalid_phone` | Not an Israeli mobile number in E.164 form (`+9725XXXXXXXX`) |
-| `429 {"error": "rate_limited", "message", "limit", "retry_after_seconds"}` + `Retry-After: <seconds>` | A limit is full. `limit`: `resend_cooldown` (60 s between codes), `phone_hour` / `phone_day` (5 / 10 per number), `ip_hour` / `ip_day` (30 / 200 per client IP). A number's limits block only that number; an IP limit blocks every number from that IP. If several are full, the one that frees up last |
+| `429 {"error": "rate_limited", "message", "limit", "retry_after_seconds"}` + `Retry-After: <seconds>` | A limit is full. `limit`: `resend_cooldown` (60 s between codes), `phone_hour` / `phone_day` (5 / 10 per number), `ip_hour` / `ip_day` (30 / 200 per client IP). A number's limits block only that number; an IP limit blocks every number from that IP. If several are full (the cooldown included), the one that frees up last, so the wait is the real one |
 | `503 sms_unavailable` | Global daily SMS cap reached (+ `Retry-After`: seconds until midnight UTC), Redis unreachable (fail closed), SMS provider failed, or not configured |
 
 The limits apply to registered and unknown numbers alike, and the endpoint never reads `users`, so no

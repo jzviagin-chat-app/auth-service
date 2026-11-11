@@ -192,6 +192,22 @@ async def test_phone_hourly_limit(app: FastAPI, monkeypatch: pytest.MonkeyPatch)
     assert len(app.state.sms.sent) == 2
 
 
+async def test_the_last_code_of_the_hour_tells_the_real_wait(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After the hour's last code, neither the 202 nor a tap during the cooldown promises 60 s."""
+    set_setting(monkeypatch, "OTP_PHONE_MAX_PER_HOUR", "2")
+    status, r = await request_code(app)
+    assert (status, r["json"]["resend_after_seconds"]) == (202, 60)
+    await end_cooldown(app)
+    status, r = await request_code(app)  # the 2nd and last of this hour
+    assert status == 202
+    assert 3500 < r["json"]["resend_after_seconds"] <= 3600
+    status, r = await request_code(app)  # right away: the cooldown runs, but the hour is full
+    assert (status, r["json"]["limit"]) == (429, "phone_hour")
+    assert 3500 < r["json"]["retry_after_seconds"] <= 3600
+
+
 async def test_ip_hourly_limit(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None:
     set_setting(monkeypatch, "OTP_IP_MAX_PER_HOUR", "2")
     assert (await request_code(app, "+972501111111"))[0] == 202

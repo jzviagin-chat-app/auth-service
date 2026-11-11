@@ -54,24 +54,28 @@ class LimitsUnavailable(Exception):
     """Redis is unreachable or failed: we can't check the limits."""
 
 
-async def check_and_count(redis: Redis, limits: Limits, phone_ref: str, ip: str) -> None:
-    """Raise RateLimited if this phone/IP may not get a code now; otherwise count this request."""
+async def check_and_count(redis: Redis, limits: Limits, phone_ref: str, ip: str) -> int:
+    """Raise RateLimited if this phone/IP may not get a code now; otherwise count this request
+    and return the seconds until the next one may be requested."""
     try:
-        await _check_and_count(redis, limits, phone_ref, ip)
+        return await _check_and_count(redis, limits, phone_ref, ip)
     except RedisError as e:
         raise LimitsUnavailable(type(e).__name__) from e
 
 
 # KEYS[1] = the cooldown key, KEYS[2..5] = the windows. ARGV[1] = cooldown seconds, then for
 # window j (1..4): ARGV[2j] = its length in seconds, ARGV[2j+1] = its maximum.
-# Returns {-1, 0} when allowed (and counted), {0, wait} for the cooldown, {j, wait} for window j.
+# Refused: {0, wait} for the cooldown, {j, wait} for window j: whichever frees up last, so the
+# wait is the real one (a running cooldown doesn't hide a full window behind it).
+# Allowed (and counted): {-1, next}, next = seconds until another code is possible: the cooldown,
+# or longer when this code used a window's last slot.
 # A Redis Cluster would need every key on one node (a shared {hash tag} in the key names).
 _CHECK_AND_COUNT = """
+local blocker, wait = -1, 0
 local cooldown = redis.call('TTL', KEYS[1])
 if cooldown ~= -2 then
-  return {0, math.max(cooldown, 1)}
+  blocker, wait = 0, math.max(cooldown, 1)
 end
-local blocker, wait = -1, 0
 for j = 1, #KEYS - 1 do
   local key, seconds = KEYS[j + 1], tonumber(ARGV[2 * j])
   local count = tonumber(redis.call('GET', key) or '0')
@@ -85,11 +89,16 @@ if blocker ~= -1 then
   return {blocker, wait}
 end
 redis.call('SET', KEYS[1], 1, 'EX', ARGV[1])
+local next_ok = tonumber(ARGV[1])
 for j = 1, #KEYS - 1 do
-  redis.call('INCR', KEYS[j + 1])
-  redis.call('EXPIRE', KEYS[j + 1], ARGV[2 * j], 'NX')
+  local key = KEYS[j + 1]
+  local count = redis.call('INCR', key)
+  redis.call('EXPIRE', key, ARGV[2 * j], 'NX')
+  if count >= tonumber(ARGV[2 * j + 1]) then
+    next_ok = math.max(next_ok, redis.call('TTL', key))
+  end
 end
-return {-1, 0}
+return {-1, next_ok}
 """
 
 
@@ -97,7 +106,7 @@ def _cooldown_key(phone_ref: str) -> str:
     return f"auth:rl:phone:{phone_ref}:cooldown"
 
 
-async def _check_and_count(redis: Redis, limits: Limits, phone_ref: str, ip: str) -> None:
+async def _check_and_count(redis: Redis, limits: Limits, phone_ref: str, ip: str) -> int:
     phone_key = f"auth:rl:phone:{phone_ref}"
     windows = [
         ("phone_hour", f"{phone_key}:h", HOUR, limits.phone_per_hour),
@@ -115,8 +124,8 @@ async def _check_and_count(redis: Redis, limits: Limits, phone_ref: str, ip: str
     if blocker == 0:
         raise RateLimited("resend_cooldown", int(wait))
     if blocker > 0:
-        # The window that resets last, otherwise the next try fails again.
         raise RateLimited(windows[blocker - 1][0], int(wait))
+    return int(wait)  # allowed: when the next code may be requested
 
 
 async def cooldown_left(redis: Redis, phone_ref: str) -> int | None:

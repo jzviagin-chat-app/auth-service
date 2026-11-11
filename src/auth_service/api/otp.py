@@ -25,7 +25,7 @@ class OtpRequestIn(BaseModel):
 
 
 class OtpRequestOut(BaseModel):
-    resend_after_seconds: int  # the app can enable "resend" after this
+    resend_after_seconds: int  # the app can enable "resend" after this (60, or longer: see README)
     expires_in_seconds: int
 
 
@@ -46,7 +46,7 @@ async def request_otp(
 ) -> OtpRequestOut:
     """Send a code by SMS. The same 202 for every number, registered or not."""
     try:
-        await otp.request_code(
+        resend_after = await otp.request_code(
             phone=body.phone,
             ip=request.client.host if request.client else None,
             session=db,
@@ -75,7 +75,7 @@ async def request_otp(
         ) from e
 
     return OtpRequestOut(
-        resend_after_seconds=ctx.policy.limits.cooldown_seconds,
+        resend_after_seconds=resend_after,
         expires_in_seconds=int(ctx.policy.ttl.total_seconds()),
     )
 
