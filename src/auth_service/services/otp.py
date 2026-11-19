@@ -26,6 +26,7 @@ from auth_service.services.rate_limit import (
     Limits,
     LimitsUnavailable,
     RateLimited,
+    Window,
     check_and_count,
     cooldown_left,
     uncount,
@@ -136,10 +137,10 @@ async def request_code(
     pepper: bytes,
     policy: OtpPolicy,
     now: datetime,
-) -> int:
+) -> tuple[int, Window | None]:
     """Send a new code to `phone`, or raise InvalidPhone / RateLimited / SmsUnavailable.
     Returns the seconds until the next code may be requested (the cooldown, or longer when this
-    code used the last one of an hour or day)."""
+    code used the last one of an hour or day), and that window's name when it is longer."""
     if not is_israeli_mobile(phone):
         OTP_REQUESTS.labels("invalid_phone").inc()
         raise InvalidPhone
@@ -150,7 +151,7 @@ async def request_code(
     # 1. Per-phone / per-IP limits (Redis).
     try:
         ref = phone_ref(pepper, phone)
-        resend_after = await check_and_count(redis, policy.limits, ref, ip or "unknown")
+        resend_after, window = await check_and_count(redis, policy.limits, ref, ip or "unknown")
     except RateLimited as e:
         log.warning("otp rate limited", extra={"phone": masked, "ip": ip, "limit": e.limit})
         OTP_REQUESTS.labels(f"rate_limited_{e.limit}").inc()
@@ -190,7 +191,7 @@ async def request_code(
     log.info("sms sent", extra={"phone": masked, "provider": sms.name, "message_id": message_id})
     SMS_SENT.labels(sms.name, "ok").inc()
     OTP_REQUESTS.labels("sent").inc()
-    return resend_after
+    return resend_after, window
 
 
 async def resend_after(redis: Redis | None, pepper: bytes, phone: str) -> int | None:
