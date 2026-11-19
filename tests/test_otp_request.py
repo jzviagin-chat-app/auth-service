@@ -201,7 +201,7 @@ async def test_the_last_code_of_the_hour_tells_the_real_wait(
     assert (status, r["json"]["resend_after_seconds"]) == (202, 60)
     await end_cooldown(app)
     status, r = await request_code(app)  # the 2nd and last of this hour
-    assert status == 202
+    assert (status, r["json"]["limit"]) == (202, "phone_hour")
     assert 3500 < r["json"]["resend_after_seconds"] <= 3600
     status, r = await request_code(app)  # right away: the cooldown runs, but the hour is full
     assert (status, r["json"]["limit"]) == (429, "phone_hour")
@@ -216,6 +216,28 @@ async def test_ip_hourly_limit(app: FastAPI, monkeypatch: pytest.MonkeyPatch) ->
     assert (status, r["json"]["limit"]) == (429, "ip_hour")
     # The refused request didn't start that phone's cooldown: right away from another IP it works.
     assert (await request_code(app, "+972503333333", ip="198.51.100.1"))[0] == 202
+
+
+async def test_the_last_code_from_an_ip_names_the_ip(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 202 says whose wait it is: an IP's blocks every number from that network."""
+    set_setting(monkeypatch, "OTP_IP_MAX_PER_HOUR", "2")
+    status, r = await request_code(app, "+972501111111")
+    assert (status, "limit" in r["json"]) == (202, False)  # just the cooldown
+    status, r = await request_code(app, "+972502222222")  # the IP's last code of this hour
+    assert (status, r["json"]["limit"]) == (202, "ip_hour")
+    assert 3500 < r["json"]["resend_after_seconds"] <= 3600
+
+
+async def test_the_longest_filled_window_is_named(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    set_setting(monkeypatch, "OTP_PHONE_MAX_PER_HOUR", "1")
+    set_setting(monkeypatch, "OTP_IP_MAX_PER_DAY", "1")
+    status, r = await request_code(app)  # fills the number's hour and the IP's day
+    assert (status, r["json"]["limit"]) == (202, "ip_day")
+    assert 86000 < r["json"]["resend_after_seconds"] <= 86400
 
 
 async def limit_counters(app: FastAPI) -> dict[str, str]:

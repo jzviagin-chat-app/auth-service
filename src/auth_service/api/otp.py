@@ -14,7 +14,7 @@ from auth_service.api.deps import DbSession, LoginContext, LoginContextDep, OtpC
 from auth_service.api.errors import ApiError
 from auth_service.api.schemas import DeviceIn, LoggedInOut
 from auth_service.services import devices, login, otp, registration
-from auth_service.services.rate_limit import RateLimited
+from auth_service.services.rate_limit import RateLimited, Window
 
 router = APIRouter(prefix="/otp", tags=["otp"])
 
@@ -27,11 +27,18 @@ class OtpRequestIn(BaseModel):
 class OtpRequestOut(BaseModel):
     resend_after_seconds: int  # the app can enable "resend" after this (60, or longer: see README)
     expires_in_seconds: int
+    limit: Window | None = Field(
+        default=None,
+        description="Only when resend_after_seconds is longer than the resend cooldown: the "
+        "window this code filled (the 429's names). phone_*: only this number waits; "
+        "ip_*: every number from this network.",
+    )
 
 
 @router.post(
     "/request",
     status_code=202,
+    response_model_exclude_none=True,  # no "limit": null on a plain cooldown
     responses={
         400: {"description": "invalid_phone"},
         429: {
@@ -46,7 +53,7 @@ async def request_otp(
 ) -> OtpRequestOut:
     """Send a code by SMS. The same 202 for every number, registered or not."""
     try:
-        resend_after = await otp.request_code(
+        resend_after, window = await otp.request_code(
             phone=body.phone,
             ip=request.client.host if request.client else None,
             session=db,
@@ -77,6 +84,7 @@ async def request_otp(
     return OtpRequestOut(
         resend_after_seconds=resend_after,
         expires_in_seconds=int(ctx.policy.ttl.total_seconds()),
+        limit=window,
     )
 
 
